@@ -255,6 +255,12 @@ async def run(args: argparse.Namespace) -> None:
     log_handler = JournalLogHandler(journal)
     logging.getLogger().addHandler(log_handler)
 
+    restart_task = None
+    if args.restart_daily_at:
+        restart_task = asyncio.create_task(
+            _stop_daily_at(parse_hhmm(args.restart_daily_at), engine)
+        )
+
     review_task = None
     if session:
         review_task = asyncio.create_task(
@@ -269,7 +275,7 @@ async def run(args: argparse.Namespace) -> None:
     try:
         await engine.run()
     finally:
-        for task in (pipeline_task, review_task):
+        for task in (pipeline_task, review_task, restart_task):
             if task:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -279,6 +285,22 @@ async def run(args: argparse.Namespace) -> None:
             recorder.close()
         journal.close()
         log.info("stopped; realized=%.2f total=%.2f", risk.realized_pnl, risk.total_pnl())
+
+
+async def _stop_daily_at(when, engine: Engine) -> None:
+    """Exit cleanly at `when` (ET) so the service manager starts a fresh process, which
+    rebuilds the watchlist from that day's scanners and reconnects from scratch."""
+    from datetime import datetime, timedelta
+
+    from .session import NEW_YORK
+
+    now = datetime.now(NEW_YORK)
+    target = datetime.combine(now.date(), when, NEW_YORK)
+    if target <= now:
+        target += timedelta(days=1)
+    await asyncio.sleep((target - now).total_seconds())
+    log.info("daily restart time %s reached: stopping for a fresh start", when)
+    engine.stop()
 
 
 SECRET_MARKERS = ("key", "secret", "token", "password")
@@ -361,6 +383,12 @@ def main() -> None:
         help="add symbols from IBKR scanners at startup (largecap, smallcap, penny)",
     )
     parser.add_argument("--max-symbols", type=int, default=30)
+    parser.add_argument(
+        "--restart-daily-at",
+        metavar="HH:MM",
+        help="exit cleanly at this ET time each day so a service manager restarts the agent "
+        "with a fresh watchlist (e.g. 08:45)",
+    )
     parser.add_argument("--no-news", action="store_true", help="disable the LLM news pipeline")
     parser.add_argument(
         "--record", action="store_true", help="record ticks, news and signals for backtesting"

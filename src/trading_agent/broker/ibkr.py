@@ -38,6 +38,9 @@ class IBKRBroker:
         self.ib = IB()
         self._contracts: dict[str, Stock] = {}
         self._trades: dict[str, Trade] = {}
+        self._by_con_id: dict[int, str] = {}
+        self._on_tick: TickCallback | None = None
+        self._handlers_attached = False
 
     async def connect(self) -> None:
         c = self.config
@@ -49,7 +52,10 @@ class IBKRBroker:
                 f"paper mode, but IBKR reports account(s) {accounts}: paper account IDs "
                 "start with 'D'. Log IB Gateway/TWS into the paper account."
             )
-        self.ib.errorEvent += self._on_error
+        if not self._handlers_attached:  # the IB object survives reconnects: attach once
+            self.ib.errorEvent += self._on_error
+            self.ib.pendingTickersEvent += self._handle_tickers
+            self._handlers_attached = True
         log.info(
             "connected to IBKR %s:%s (client %s), accounts %s",
             c.host,
@@ -66,10 +72,26 @@ class IBKRBroker:
         if self.ib.isConnected():
             self.ib.disconnect()
 
+    def is_connected(self) -> bool:
+        return self.ib.isConnected()
+
+    async def reconnect(self) -> None:
+        """Drop whatever is left of the old session and log in again. Orders placed
+        before the drop are no longer tracked here; the engine re-syncs from IBKR."""
+        if self.ib.isConnected():
+            self.ib.disconnect()
+        self._trades.clear()
+        await self.connect()
+
+    async def resubscribe(self) -> None:
+        """Request market data again for every subscribed symbol after a reconnect."""
+        for contract in self._contracts.values():
+            self.ib.reqMktData(contract, "", False, False)
+
     async def subscribe(self, symbols: list[str], on_tick: TickCallback) -> None:
         contracts = [Stock(s, "SMART", "USD") for s in symbols]
         await self.ib.qualifyContractsAsync(*contracts)
-        by_con_id: dict[int, str] = {}
+        self._on_tick = on_tick
         for sym, contract in zip(symbols, contracts, strict=True):
             if not contract.conId:
                 log.warning("%s: not found at IBKR; skipping", sym)
@@ -79,26 +101,26 @@ class IBKRBroker:
                 log.warning("%s trades OTC (%s); skipping", sym, contract.primaryExchange)
                 continue
             self._contracts[sym] = contract
-            by_con_id[contract.conId] = sym
+            self._by_con_id[contract.conId] = sym
             self.ib.reqMktData(contract, "", False, False)
 
-        def handle(tickers: set[Ticker]) -> None:
-            for t in tickers:
-                sym = by_con_id.get(t.contract.conId)
-                if sym:
-                    on_tick(
-                        Tick(
-                            sym,
-                            _num(t.bid),
-                            _num(t.ask),
-                            _num(t.last),
-                            time.time(),
-                            _num(t.bidSize),
-                            _num(t.askSize),
-                        )
+    def _handle_tickers(self, tickers: set[Ticker]) -> None:
+        if self._on_tick is None:
+            return
+        for t in tickers:
+            sym = self._by_con_id.get(t.contract.conId)
+            if sym:
+                self._on_tick(
+                    Tick(
+                        sym,
+                        _num(t.bid),
+                        _num(t.ask),
+                        _num(t.last),
+                        time.time(),
+                        _num(t.bidSize),
+                        _num(t.askSize),
                     )
-
-        self.ib.pendingTickersEvent += handle
+                )
 
     def place_limit(self, intent: OrderIntent, on_fill: FillCallback, on_done: DoneCallback) -> str:
         contract = self._contracts[intent.symbol]

@@ -83,10 +83,75 @@ stay up during market hours; one in a US-East datacenter is ideal.
 5. **Start:** `scripts/paper.sh`. It builds `data/watchlist.txt` from IBKR's scanners if
    it doesn't exist, runs the pre-flight checks, and starts the agent with recording on,
    logging to `logs/`. Run it inside tmux or screen so it keeps going when you log out.
+   On a server, use the Docker or systemd setup below instead.
 6. **Every trading day after 16:10 ET:** read `data/reviews/<date>/summary.md`. Then run
    `python -m trading_agent.review analyze --date <date>` and `python -m trading_agent.report`.
    Apply only the parameter changes you agree with (see "Daily review and the training
    period").
+
+## Running on a VPS (headless)
+
+The agent is a plain Python process. IB Gateway is a desktop app, so on a server it runs
+on a virtual display (Xvfb) with IBC filling in the login and handling its nightly
+restart. Recommended VPS: 2 vCPU, 4 GB RAM, US-East region.
+
+**What keeps it running unattended:**
+- **Reconnection:** if Gateway restarts or the connection drops, the agent retries with
+  backoff, then re-syncs from IBKR:
+  - cancels its leftover orders
+  - adopts IBKR's positions (differences are logged as `position_resync` events and
+    closed out in the journal as `resync_after_disconnect`)
+  - refreshes the account and re-subscribes to market data
+- **Daily restart:** with `RESTART_DAILY_AT=08:45` the agent exits cleanly each morning.
+  The service manager starts it again, which rebuilds the watchlist from that day's
+  scanners (`REFRESH_WATCHLIST=yes`). Off-hours news is re-fetched for the 09:20 briefing.
+- **Safe startup:** `scripts/run.sh` (used by both options below) waits for Gateway, runs
+  the pre-flight checks with retries, and refuses to start if they fail. The
+  service manager then retries every 30s.
+
+### Option A: Docker (simplest)
+
+```bash
+git clone <repo> /opt/JEWBOT9000 && cd /opt/JEWBOT9000
+cp .env.example .env && cp gateway.env.example gateway.env    # fill both in
+chmod 600 .env gateway.env
+CODE_VERSION=$(git rev-parse --short HEAD) docker compose up -d --build
+docker compose logs -f agent
+```
+
+- **Gateway:** the `ib-gateway` service uses the community image `ghcr.io/gnzsnz/ib-gateway`
+  (IB Gateway, IBC and Xvfb), logged in to the paper account from `gateway.env`.
+- **Networking:** the agent reaches it inside the compose network on port 4004. Nothing is
+  published to the internet.
+- **Watching Gateway:** its VNC screen is bound to the VPS's localhost only. Use
+  `ssh -L 5900:localhost:5900 you@vps`, then connect a VNC viewer to `localhost:5900`.
+- **Data:** journal, reviews, state and recordings live in `./data` on the host.
+- **Daily routine:** run the review commands with
+  `docker compose exec agent python -m trading_agent.review analyze`.
+
+### Option B: systemd
+
+1. **Get the code:** create a `trader` user, clone to `/opt/JEWBOT9000`,
+   `python3 -m venv .venv && .venv/bin/pip install -e .`, and fill in `.env`.
+2. **Set up IB Gateway:**
+   - Install IB Gateway (stable) and IBC (github.com/IbcAlpha/IBC) and `apt install xvfb`.
+   - Create `~/ibc/config.ini` as described at the top of
+     `deploy/systemd/ib-gateway.service` (paper login, `TradingMode=paper`,
+     `ReadOnlyApi=no`, `AutoRestartTime`), and `chmod 600` it.
+3. **Install and start the services:**
+   `sudo cp deploy/systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload &&
+   sudo systemctl enable --now ib-gateway trading-agent`
+4. **Follow the logs:** `journalctl -u trading-agent -f`
+
+**Security either way:**
+- Never expose the API port (4001–4004) or VNC publicly.
+- Keep `.env`, `gateway.env` and IBC's `config.ini` readable only by their owner.
+- Use SSH keys and a firewall.
+
+**Two-factor authentication:**
+- **Paper:** paper logins normally don't need 2FA, so Gateway can log in unattended.
+- **Live:** live accounts do. IBC can only wait for you to approve the phone prompt,
+  usually once a week, after the Sunday re-login.
 
 ## Setup
 

@@ -67,6 +67,8 @@ def _et(ts: float | None) -> str | None:
 
 
 def code_version() -> str:
+    if os.environ.get("CODE_VERSION"):  # set at image build time (no .git in containers)
+        return os.environ["CODE_VERSION"]
     try:
         return (
             subprocess.run(

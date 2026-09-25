@@ -1,0 +1,31 @@
+# IB Gateway, logged in automatically by IBC (github.com/IbcAlpha/IBC), on a virtual
+# display (Xvfb) so no screen is needed.
+#
+# Prerequisites (as the "trader" user), see README "Running on a VPS":
+#   - IB Gateway (stable) installed in /home/trader/Jts/ibgateway/<version>
+#   - IBC unpacked in /opt/ibc, with /home/trader/ibc/config.ini containing at least:
+#       IbLoginId=<paper username>
+#       IbPassword=<paper password>
+#       TradingMode=paper
+#       ReadOnlyApi=no
+#       AcceptIncomingConnectionAction=accept
+#       AutoRestartTime=11:55 PM
+#     (chmod 600 /home/trader/ibc/config.ini)
+#   - TWS_MAJOR_VRSN in /opt/ibc/gatewaystart.sh set to the installed Gateway version
+#   - apt install xvfb
+[Unit]
+Description=IB Gateway (IBC, headless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Environment=DISPLAY=:1
+ExecStart=/usr/bin/xvfb-run -a /opt/ibc/gatewaystart.sh -inline
+Restart=always
+RestartSec=60
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -48,6 +48,14 @@ class RiskManager:
     def position(self, symbol: str) -> int:
         return self._pos(symbol).qty
 
+    def mark(self, symbol: str) -> float | None:
+        return self._marks.get(symbol)
+
+    def clear_pending(self) -> None:
+        """Forget reserved exposure of working orders (they're no longer tracked)."""
+        for p in self._positions.values():
+            p.pending_buy = p.pending_sell = 0
+
     def avg_price(self, symbol: str) -> float:
         return self._pos(symbol).avg_price
 

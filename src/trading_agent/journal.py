@@ -29,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .models import Fill, NewsItem, OrderIntent, Signal, Tick
+from .models import Fill, NewsItem, OrderIntent, Side, Signal, Tick
 
 log = logging.getLogger(__name__)
 
@@ -206,6 +206,7 @@ class Journal:
         self._last_closed: dict[str, int] = {}
         self._pending: dict[str, list[_PendingOutcome]] = {}
         self._decision_reasons: OrderedDict[int, str] = OrderedDict()
+        self._forced_exit: dict[str, str] = {}
         self.run_id: int | None = None
         self._bars: dict[str, _Bar] = {}
         self._last_skip: dict[tuple[str, str, str], tuple[float, int]] = {}
@@ -323,6 +324,22 @@ class Journal:
         t.entry_qty, t.entry_value = abs(qty), abs(qty) * avg_price
         self._open[symbol] = t
 
+    def resync_position(self, symbol: str, qty: int, avg_price: float, mark: float) -> None:
+        """After a disconnect, adopt the broker's position. If ours differs, the open
+        trade is closed at the last known price (exit reason resync_after_disconnect:
+        the true fills happened while we couldn't see them) and any broker position is
+        tracked as a new inherited trade."""
+        t = self._open.get(symbol)
+        ours = t.qty if t else 0
+        if ours == qty:
+            return
+        if t is not None:
+            self._forced_exit[symbol] = "resync_after_disconnect"
+            side = Side.SELL if t.qty > 0 else Side.BUY
+            self._apply_fill(Fill("resync", symbol, side, abs(t.qty), mark, self._clock()), None)
+        if qty:
+            self.seed_position(symbol, qty, avg_price)
+
     def on_fill(self, fill: Fill, decision_id: int | None) -> None:
         self.db.execute(
             "INSERT INTO fills (decision_id, order_id, ts, symbol, side, qty, price, commission)"
@@ -379,6 +396,7 @@ class Journal:
         net = t.gross - t.fees
         last_exit = t.exits[-1][0] if t.exits else None
         exit_reason = self._decision_reasons.get(last_exit, "unknown") if last_exit else "unknown"
+        exit_reason = self._forced_exit.pop(t.symbol, exit_reason)
         entry_ctx = t.entries[0].context if t.entries else {}
         cur = self.db.execute(
             "INSERT INTO trades (symbol, direction, opened_at, closed_at, max_qty, avg_entry,"

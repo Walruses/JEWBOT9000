@@ -57,6 +57,15 @@ class SimBroker:
     async def positions(self) -> dict[str, tuple[int, float]]:
         return {s: (q, self._avg.get(s, 0.0)) for s, q in self._positions.items() if q}
 
+    def is_connected(self) -> bool:
+        return True
+
+    async def reconnect(self) -> None:
+        pass
+
+    async def resubscribe(self) -> None:
+        pass
+
     async def account(self) -> None:
         return None  # the engine falls back to starting equity + PnL
 

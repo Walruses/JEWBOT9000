@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-LIVE_PORTS = frozenset({7496, 4001})
-PAPER_PORTS = frozenset({7497, 4002})
+# TWS / IB Gateway defaults, plus 4003/4004: the ports the ib-gateway Docker image
+# forwards to other containers (for live / paper respectively).
+LIVE_PORTS = frozenset({7496, 4001, 4003})
+PAPER_PORTS = frozenset({7497, 4002, 4004})
 
 
 @dataclass(frozen=True)

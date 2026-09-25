@@ -30,6 +30,7 @@ class FakeIB:
     def __init__(self, accounts):
         self.accounts = accounts
         self.errorEvent = _Event()
+        self.pendingTickersEvent = _Event()
         self.disconnected = False
 
     async def connectAsync(self, *a, **kw):

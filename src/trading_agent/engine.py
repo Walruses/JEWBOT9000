@@ -8,6 +8,7 @@ every position back to flat before the close.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -89,6 +90,7 @@ class Engine:
         self.account = account
         risk.account = account
         self._stop_cooldown_until: dict[str, float] = {}
+        self.reconnect_backoff = 5.0  # first retry delay; doubles up to 60s
         # (symbol, price) -> stop distance in %, fixed per position when it opens.
         self.stop_pct = stop_pct
         self._entry_stop: dict[str, float] = {}
@@ -121,7 +123,10 @@ class Engine:
                 try:
                     await asyncio.wait_for(self._stop.wait(), self.reconcile_interval)
                 except TimeoutError:
-                    await self.reconcile()
+                    if self.broker.is_connected():
+                        await self.reconcile()
+                    else:
+                        await self._reconnect()
         finally:
             self.broker.cancel_all()
             self._save_state()
@@ -130,20 +135,36 @@ class Engine:
     def stop(self) -> None:
         self._stop.set()
 
-    async def startup(self) -> None:
-        """Bring local state in line with the broker and with today's saved state."""
+    async def startup(self, reconnect: bool = False) -> None:
+        """Bring local state in line with the broker and with today's saved state.
+        After a reconnect the broker's positions win over ours (fills may have happened
+        while we were disconnected); saved daily state is only restored at first start."""
         # Orders left working by a previous (crashed) run would otherwise fill untracked.
         self.broker.cancel_all()
 
         held = await self.broker.positions()
         for sym in self.strategy.symbols:
             qty, avg = held.get(sym, (0, 0.0))
+            if reconnect:
+                ours = self.risk.position(sym)
+                if ours != qty:
+                    log.warning(
+                        "after reconnect %s: ours=%+d broker=%+d; using broker's", sym, ours, qty
+                    )
+                    self._event("position_resync", sym, ours=ours, broker=qty, avg_price=avg)
+                if self.journal:
+                    self.journal.resync_position(sym, qty, avg, self.risk.mark(sym) or avg)
+                self.risk.set_position(sym, qty, avg)
+                continue
             self.risk.set_position(sym, qty, avg)
             if qty and self.journal:
                 self.journal.seed_position(sym, qty, avg)
             if qty:
                 log.warning("starting with existing position %s %+d @ %.4f", sym, qty, avg)
                 self._event("inherited_position", sym, qty=qty, avg_price=avg)
+        if reconnect:
+            await self._refresh_account()
+            return
         others = sorted(set(held) - set(self.strategy.symbols))
         if others:
             log.info("ignoring positions in symbols not traded by this agent: %s", others)
@@ -164,6 +185,37 @@ class Engine:
                 st.halted,
             )
             self._save_state()
+
+    async def _reconnect(self) -> None:
+        """The broker connection dropped (e.g. IB Gateway's nightly restart): retry with
+        backoff, then re-sync orders, positions and market data from the broker."""
+        log.warning("lost connection to broker; reconnecting")
+        self._event(
+            "broker_disconnected",
+            working_orders=len(self.working),
+            positions=self.risk.positions(),
+        )
+        # Orders sent before the drop can no longer be tracked here; startup() cancels
+        # any still working at the broker, and positions are re-read from it.
+        self.working.clear()
+        self.risk.clear_pending()
+        delay = self.reconnect_backoff
+        while not self._stop.is_set():
+            try:
+                await self.broker.reconnect()
+                break
+            except Exception as e:
+                log.warning("reconnect failed (%r); retrying in %.0fs", e, delay)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._stop.wait(), delay)
+                delay = min(delay * 2, 60.0)
+        if self._stop.is_set():
+            return
+        await self.startup(reconnect=True)
+        await self.broker.resubscribe()
+        self._mismatch_strikes.clear()
+        log.info("reconnected to broker")
+        self._event("broker_reconnected", positions=self.risk.positions())
 
     async def _refresh_account(self) -> AccountInfo | None:
         if not self.account:

@@ -1,0 +1,24 @@
+# The trading agent as a systemd service (alternative to docker-compose).
+# Install: see README "Running on a VPS". Assumes the repo at /opt/JEWBOT9000 with a
+# .venv, owned by the "trader" user, and IB Gateway on this host (ib-gateway.service).
+[Unit]
+Description=AI trading agent (paper)
+After=network-online.target ib-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/opt/JEWBOT9000
+EnvironmentFile=/opt/JEWBOT9000/.env
+Environment=MODE=paper REFRESH_WATCHLIST=yes RESTART_DAILY_AT=08:45
+ExecStart=/opt/JEWBOT9000/scripts/run.sh
+# Always restart: after the daily 08:45 exit, crashes, or a failed pre-flight.
+Restart=always
+RestartSec=30
+# SIGTERM makes the agent cancel its orders, save state and disconnect.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

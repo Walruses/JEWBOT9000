@@ -1,0 +1,47 @@
+# Headless paper trading on a VPS: IB Gateway (with IBC auto-login and a virtual display)
+# plus the agent.
+#
+#   cp .env.example .env              # agent settings and API keys
+#   cp gateway.env.example gateway.env  # IBKR paper username/password
+#   CODE_VERSION=$(git rev-parse --short HEAD) docker compose up -d --build
+#   docker compose logs -f agent
+#
+# Nothing is exposed publicly: the API port is only reachable inside the compose network,
+# and VNC (to look at Gateway if needed) only on the VPS's localhost -- use an SSH tunnel:
+#   ssh -L 5900:localhost:5900 you@vps   then connect a VNC viewer to localhost:5900
+services:
+  ib-gateway:
+    # Community image bundling IB Gateway, IBC and Xvfb:
+    # https://github.com/gnzsnz/ib-gateway-docker -- see its README for all options.
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: unless-stopped
+    env_file: gateway.env
+    environment:
+      TRADING_MODE: paper
+      READ_ONLY_API: "no"
+      TIME_ZONE: America/New_York
+      # Gateway restarts itself nightly; the agent reconnects automatically.
+      AUTO_RESTART_TIME: "11:55 PM"
+    ports:
+      - "127.0.0.1:5900:5900"
+
+  agent:
+    build:
+      context: .
+      args:
+        CODE_VERSION: ${CODE_VERSION:-unknown}
+    restart: unless-stopped
+    depends_on:
+      - ib-gateway
+    env_file: .env
+    environment:
+      # Inside the compose network the image forwards paper trading to port 4004.
+      IB_HOST: ib-gateway
+      IB_PORT: "4004"
+      MODE: paper
+      REFRESH_WATCHLIST: "yes"
+      RESTART_DAILY_AT: "08:45"
+    volumes:
+      - ./data:/app/data
+    stop_signal: SIGTERM
+    stop_grace_period: 60s

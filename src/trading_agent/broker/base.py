@@ -19,6 +19,16 @@ class Broker(Protocol):
 
     async def disconnect(self) -> None: ...
 
+    def is_connected(self) -> bool: ...
+
+    async def reconnect(self) -> None:
+        """Re-establish the session after a drop (e.g. a nightly Gateway restart)."""
+        ...
+
+    async def resubscribe(self) -> None:
+        """Restore market data subscriptions after reconnect()."""
+        ...
+
     async def positions(self) -> dict[str, tuple[int, float]]:
         """Current stock positions as {symbol: (qty, avg_price)}."""
         ...

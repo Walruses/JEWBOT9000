@@ -29,6 +29,14 @@ class Result:
     detail: str
 
 
+def market_open() -> bool:
+    import time
+
+    from .session import Phase, TradingSession
+
+    return TradingSession().phase(time.time()) is not Phase.CLOSED
+
+
 def evaluate_equity(net_liq: float | None, expected: float) -> Result:
     if net_liq is None:
         return Result(FAIL, "account size", "IBKR did not report NetLiquidation")
@@ -149,13 +157,21 @@ async def check_ibkr(symbols: list[str], expected_equity: float) -> list[Result]
                         "real-time data needs a subscription",
                     )
                 )
+            elif not market_open():
+                out.append(
+                    Result(
+                        WARN,
+                        "market data",
+                        f"no quote for {good[0].symbol}, but the market is closed; "
+                        "run the check again during market hours",
+                    )
+                )
             else:
                 out.append(
                     Result(
                         FAIL,
                         "market data",
-                        f"no quote for {good[0].symbol}. Outside market hours this "
-                        "can be normal; otherwise subscribe to US real-time data and, "
+                        f"no quote for {good[0].symbol}. Subscribe to US real-time data and, "
                         "for a paper account, share the live account's market data "
                         "(Client Portal > Settings > Paper Trading Account)",
                     )
