@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from .hub import SignalHub
 
 DEFAULT_WEIGHTS = {"llm": 0.6, "micro:imbalance": 0.25, "micro:reversion": 0.15}
+# Sources allowed to originate a position. Others (the microstructure signals) only
+# adjust the timing and size of a view an opener already holds.
+DEFAULT_OPENERS = frozenset({"llm"})
 
 
 @dataclass
@@ -17,17 +20,47 @@ class SignalFusion:
     weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     # Ignore combined conviction below this to avoid churning on noise.
     entry_threshold: float = 0.15
+    openers: frozenset[str] = DEFAULT_OPENERS
 
     def weight(self, source: str) -> float:
         if source in self.weights:
             return self.weights[source]
         return self.weights.get(source.split(":", 1)[0], 0.0)
 
+    def is_opener(self, source: str) -> bool:
+        return source in self.openers or source.split(":", 1)[0] in self.openers
+
+    def primary_conviction(self, symbol: str) -> float:
+        """Conviction from openers (the LLM) alone, without microstructure adjustments."""
+        total = sum(
+            self.weight(sig.source) * sig.confidence * decay * sig.score
+            for sig, decay in self.hub.active(symbol)
+            if self.is_opener(sig.source)
+        )
+        return max(-1.0, min(1.0, total))
+
+    def target_for(self, conviction: float) -> int:
+        if abs(conviction) < self.entry_threshold:
+            return 0
+        return round(conviction * self.max_position)
+
     def conviction(self, symbol: str) -> float:
-        """Weighted sum of signals in [-1, 1]; sources agreeing reinforce each other."""
-        total = 0.0
+        """Weighted sum of signals in [-1, 1]; sources agreeing reinforce each other.
+
+        Zero unless an opener (the LLM) holds a view. Other sources can strengthen or
+        weaken that view but never create one or flip its direction."""
+        primary = modifiers = 0.0
         for sig, decay in self.hub.active(symbol):
-            total += self.weight(sig.source) * sig.confidence * decay * sig.score
+            contribution = self.weight(sig.source) * sig.confidence * decay * sig.score
+            if self.is_opener(sig.source):
+                primary += contribution
+            else:
+                modifiers += contribution
+        if primary == 0:
+            return 0.0
+        total = primary + modifiers
+        if (total > 0) != (primary > 0):
+            return 0.0
         return max(-1.0, min(1.0, total))
 
     def breakdown(self, symbol: str) -> list[dict]:
@@ -49,7 +82,4 @@ class SignalFusion:
         return rows
 
     def target_position(self, symbol: str) -> int:
-        c = self.conviction(symbol)
-        if abs(c) < self.entry_threshold:
-            return 0
-        return round(c * self.max_position)
+        return self.target_for(self.conviction(symbol))

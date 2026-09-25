@@ -12,6 +12,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import anthropic
@@ -21,6 +22,9 @@ from .models import NewsItem, Signal
 log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_ROUTINE_MODEL = "claude-sonnet-5"
+# Models that accept the server-side `fallbacks` parameter.
+SERVER_FALLBACK_MODELS = frozenset({"claude-opus-5", "claude-fable-5-1"})
 
 SYSTEM_PROMPT = """\
 You are the news analyst for an automated intraday equity trading system. For one stock \
@@ -101,6 +105,11 @@ def render_items(
 
 
 class ClaudeAnalyst:
+    """Routes each batch to a model: routine news and social posts go to the cheaper
+    routine model; SEC filings and pre-open briefings go to the main model. A refusal
+    from the routine model is retried once on the main model. The journal records which
+    model produced each signal, so the report can check the cheaper model holds up."""
+
     source = "llm:news"
 
     def __init__(
@@ -109,36 +118,38 @@ class ClaudeAnalyst:
         model: str = DEFAULT_MODEL,
         effort: str = "medium",
         track_records: dict[str, str] | None = None,
+        routine_model: str | None = DEFAULT_ROUTINE_MODEL,
+        important_sources: tuple[str, ...] = ("edgar",),
     ):
         self.client = client or anthropic.AsyncAnthropic()
         self.model = model
+        self.routine_model = routine_model
+        self.important_sources = important_sources
         self.effort = effort
         # news source -> human-readable track record, from the journal report
         self.track_records = track_records or {}
 
+    def pick_model(self, items: list[NewsItem], note: str = "") -> str:
+        if not self.routine_model or note:
+            return self.model
+        if any(i.source.split("/", 1)[0] in self.important_sources for i in items):
+            return self.model
+        return self.routine_model
+
     async def analyze(
-        self, symbol: str, items: list[NewsItem], now: float | None = None
+        self, symbol: str, items: list[NewsItem], now: float | None = None, note: str = ""
     ) -> Signal | None:
         now = time.time() if now is None else now
+        prompt = render_items(symbol, items, now, self.track_records)
+        if note:
+            prompt = f"{note}\n\n{prompt}"
+        model = self.pick_model(items, note)
         try:
-            response = await self.client.beta.messages.create(
-                model=self.model,
-                max_tokens=16000,
-                # On a safety-classifier decline, the API retries on a fallback model.
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-                system=SYSTEM_PROMPT,
-                output_config={
-                    "effort": self.effort,
-                    "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA},
-                },
-                messages=[
-                    {
-                        "role": "user",
-                        "content": render_items(symbol, items, now, self.track_records),
-                    }
-                ],
-            )
+            response = await self._request(model, prompt)
+            if response.stop_reason == "refusal" and model != self.model:
+                log.warning("%s declined %s; retrying on %s", model, symbol, self.model)
+                model = self.model
+                response = await self._request(model, prompt)
         except anthropic.RateLimitError:
             log.warning("analyst rate limited for %s; skipping this batch", symbol)
             return None
@@ -155,7 +166,26 @@ class ClaudeAnalyst:
         text = next((b.text for b in response.content if b.type == "text"), None)
         if text is None:
             return None
-        return self.to_signal(symbol, json.loads(text), now, items)
+        signal = self.to_signal(symbol, json.loads(text), now, items)
+        return replace(signal, model=model)
+
+    async def _request(self, model: str, prompt: str):
+        params = {
+            "model": model,
+            "max_tokens": 16000,
+            "system": SYSTEM_PROMPT,
+            "output_config": {
+                "effort": self.effort,
+                "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA},
+            },
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if model in SERVER_FALLBACK_MODELS:
+            # On a safety-classifier decline, the API retries on a fallback model.
+            return await self.client.beta.messages.create(
+                **params, betas=["server-side-fallback-2026-07-01"], fallbacks="default"
+            )
+        return await self.client.messages.create(**params)
 
     def to_signal(
         self, symbol: str, data: dict, now: float, items: list[NewsItem] | None = None

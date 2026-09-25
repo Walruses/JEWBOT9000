@@ -78,6 +78,7 @@ class Signal:
     id: str = ""
     inputs: tuple[str, ...] = ()
     drivers: tuple[str, ...] = ()
+    model: str = ""  # which LLM produced it
 
 
 @dataclass(frozen=True, slots=True)

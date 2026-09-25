@@ -16,16 +16,18 @@ import sys
 
 from .config import (
     DataConfig,
+    cost_config_from_env,
     data_config_from_env,
     ib_config_from_env,
     live_trading_allowed,
     risk_limits_from_env,
     runtime_config_from_env,
 )
+from .costs import CostModel
 from .engine import Engine
 from .events import Recorder
 from .journal import Journal
-from .pipeline import NewsPipeline
+from .pipeline import NewsPipeline, NewsSchedule
 from .risk import RiskManager
 from .session import TradingSession, parse_hhmm
 from .signals import SignalFusion, SignalHub
@@ -35,11 +37,16 @@ from .strategy import FusedSignalStrategy
 log = logging.getLogger("trading_agent")
 
 
-def build_broker(mode: str):
+def build_broker(mode: str, costs: CostModel | None = None):
     if mode == "sim":
         from .broker.sim import SimBroker
 
-        return SimBroker(synthetic_feed=True)
+        costs = costs or CostModel()
+        return SimBroker(
+            synthetic_feed=True,
+            commission_per_share=costs.per_share,
+            min_commission=costs.minimum,
+        )
 
     from .broker.ibkr import IBKRBroker
 
@@ -79,7 +86,13 @@ async def run(args: argparse.Namespace) -> None:
     risk = RiskManager(limits)
     hub = SignalHub()
     fusion = SignalFusion(hub, max_position=limits.max_position)
-    broker = build_broker(args.mode)
+    cost_cfg = cost_config_from_env()
+    costs = CostModel(
+        per_share=cost_cfg.commission_per_share,
+        minimum=cost_cfg.commission_min,
+        extra_per_share=cost_cfg.extra_fees_per_share,
+    )
+    broker = build_broker(args.mode, costs)
 
     rt = runtime_config_from_env()
     state_store = StateStore(rt.state_file if args.mode != "sim" else "data/state-sim.json")
@@ -102,9 +115,23 @@ async def run(args: argparse.Namespace) -> None:
         fusion.weights = dict(quality["fusion_weights"])
         log.info("fusion weights from %s: %s", rt.quality_file, fusion.weights)
 
+    edge_bps = quality.get("edge_bps_at_full_conviction") or cost_cfg.edge_bps
+    strategy = FusedSignalStrategy(
+        args.symbols,
+        hub,
+        fusion,
+        costs=costs,
+        edge_bps_at_full_conviction=edge_bps,
+        cost_safety_multiple=cost_cfg.safety_multiple,
+    )
+    log.info(
+        "cost check: edge %.1f bps at full conviction, %.1fx safety",
+        edge_bps,
+        cost_cfg.safety_multiple,
+    )
     engine = Engine(
         broker,
-        FusedSignalStrategy(args.symbols, hub, fusion),
+        strategy,
         risk,
         session=session,
         state_store=state_store,
@@ -125,6 +152,7 @@ async def run(args: argparse.Namespace) -> None:
             model=data_cfg.analyst_model,
             effort=data_cfg.analyst_effort,
             track_records=quality.get("track_records"),
+            routine_model=data_cfg.analyst_routine_model or None,
         )
         pipeline = NewsPipeline(
             sources,
@@ -134,6 +162,12 @@ async def run(args: argparse.Namespace) -> None:
             poll_interval=data_cfg.news_poll_seconds,
             recorder=recorder,
             journal=journal,
+            # Poll less often outside market hours and brief once before the open.
+            schedule=(
+                NewsSchedule(live_end=session.flatten, live_interval=data_cfg.news_poll_seconds)
+                if session
+                else None
+            ),
         )
         log.info("news sources: %s", ", ".join(s.name for s in sources))
 
@@ -142,8 +176,11 @@ async def run(args: argparse.Namespace) -> None:
             await pipeline.run()
 
         pipeline_task = asyncio.create_task(start_pipeline())
+    elif args.mode == "sim":
+        pipeline_task = asyncio.create_task(_synthetic_views(hub, args.symbols))
+        log.info("sim mode: publishing random synthetic LLM views to exercise the pipeline")
     else:
-        log.info("no news sources configured; trading on microstructure signals only")
+        log.warning("no news sources configured: without LLM views no positions are opened")
 
     try:
         await engine.run()
@@ -156,6 +193,21 @@ async def run(args: argparse.Namespace) -> None:
             recorder.close()
         journal.close()
         log.info("stopped; realized=%.2f total=%.2f", risk.realized_pnl, risk.total_pnl())
+
+
+async def _synthetic_views(hub: SignalHub, symbols: list[str]) -> None:
+    """Sim mode only: stand-in LLM views, since only LLM views may open positions."""
+    import random
+    import time
+
+    from .models import Signal
+
+    rng = random.Random(1)
+    while True:
+        for sym in symbols:
+            score = rng.choice([-1, 1]) * rng.uniform(0.3, 1.0)
+            hub.publish(Signal(sym, "llm:sim", score, rng.uniform(0.5, 1.0), time.time(), 120.0))
+        await asyncio.sleep(60)
 
 
 def _clear_halt(store: StateStore) -> None:

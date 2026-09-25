@@ -37,6 +37,8 @@ DEFAULT_QUALITY_FILE = Path("data/source_quality.json")
 HIT_HORIZON = 1800.0
 MIN_SAMPLES = 10
 PRIOR_N = 20  # pseudo-observations at 50%: a source must earn its way off neutral
+DEFAULT_EDGE_BPS = 50.0  # matches FusedSignalStrategy's default
+EDGE_PRIOR_N = 30
 
 
 def shrunk_rate(hits: int, n: int) -> float:
@@ -74,6 +76,8 @@ class Report:
     by_symbol: list[tuple]
     fusion_sources: dict[str, SourceStats]
     news_sources: dict[str, SourceStats]
+    models: dict[str, SourceStats] = field(default_factory=dict)
+    edge_moves: list[tuple[float, float]] = field(default_factory=list)
 
 
 def _since_clause(since: float | None, column: str) -> tuple[str, tuple]:
@@ -124,7 +128,12 @@ def build_report(db: sqlite3.Connection, since: float | None = None) -> Report:
 
     # News sources: which sources drove each LLM signal.
     swhere, sargs = _since_clause(since, "ts")
-    signals = {r[0]: r[1] for r in db.execute(f"SELECT id, score FROM signals{swhere}", sargs)}
+    rows = db.execute(f"SELECT id, score, confidence, model FROM signals{swhere}", sargs)
+    signals: dict[str, float] = {}
+    meta: dict[str, tuple[float, str]] = {}
+    for sid, score, confidence, model in rows:
+        signals[sid] = score
+        meta[sid] = (confidence or 0.0, model or "unknown")
     inputs: dict[str, dict[str, bool]] = defaultdict(dict)
     for sid, source, driver in db.execute(
         "SELECT signal_id, news_source, driver FROM signal_inputs"
@@ -145,20 +154,30 @@ def build_report(db: sqlite3.Connection, since: float | None = None) -> Report:
             outcomes[sid][horizon] = directional
 
     news: dict[str, SourceStats] = {}
+    models: dict[str, SourceStats] = {}
+    edge_moves: list[tuple[float, float]] = []  # (|score| x confidence, directional bps)
+
+    def score_signal(s: SourceStats, sid: str, score: float) -> None:
+        s.signals += 1
+        if score == 0:
+            return
+        s.directional += 1
+        for horizon, bps in outcomes.get(sid, {}).items():
+            if bps is not None:
+                s.bps[horizon].append(bps)
+        hit = outcomes.get(sid, {}).get(HIT_HORIZON)
+        if hit is not None:
+            s.scored += 1
+            s.hits += hit > 0
+
     for sid, score in signals.items():
         for src in sources_of(sid):
-            s = news.setdefault(src, SourceStats(src))
-            s.signals += 1
-            if score == 0:
-                continue
-            s.directional += 1
-            for horizon, bps in outcomes.get(sid, {}).items():
-                if bps is not None:
-                    s.bps[horizon].append(bps)
-            hit = outcomes.get(sid, {}).get(HIT_HORIZON)
-            if hit is not None:
-                s.scored += 1
-                s.hits += hit > 0
+            score_signal(news.setdefault(src, SourceStats(src)), sid, score)
+        confidence, model = meta[sid]
+        score_signal(models.setdefault(model, SourceStats(model)), sid, score)
+        hit = outcomes.get(sid, {}).get(HIT_HORIZON)
+        if score and hit is not None:
+            edge_moves.append((abs(score) * confidence, hit))
 
     for trade_id, _source, sid, pnl, trade_net in attr:
         if not sid or sid not in signals:
@@ -171,7 +190,7 @@ def build_report(db: sqlite3.Connection, since: float | None = None) -> Report:
                 s.winning_trades.add(trade_id)
             s.pnl += pnl / len(srcs)
 
-    return Report(trades, by_symbol, fusion, news)
+    return Report(trades, by_symbol, fusion, news, models, edge_moves)
 
 
 def suggest_fusion_weights(
@@ -188,6 +207,22 @@ def suggest_fusion_weights(
             factor = max(0.25, min(2.0, shrunk_rate(wins, n) / 0.5))
             out[name] = round(weight * factor, 4)
     return out
+
+
+def estimate_edge_bps(report: Report, llm_weight: float = DEFAULT_WEIGHTS["llm"]) -> float:
+    """Average 30-minute move a full-conviction view has been worth, for the strategy's
+    cost check. Fused conviction from one LLM signal is weight x |score| x confidence, so
+    the edge per unit conviction is mean(directional move) / mean(that). Shrunk toward
+    the default with EDGE_PRIOR_N pseudo-observations and floored at zero: if signals
+    haven't predicted anything, the cost check should stop opening positions."""
+    moves = report.edge_moves
+    strength = sum(llm_weight * m for m, _ in moves)
+    if not moves or strength <= 0:
+        return DEFAULT_EDGE_BPS
+    estimate = sum(bps for _, bps in moves) / strength
+    n = len(moves)
+    shrunk = (n * estimate + EDGE_PRIOR_N * DEFAULT_EDGE_BPS) / (n + EDGE_PRIOR_N)
+    return round(max(0.0, min(500.0, shrunk)), 1)
 
 
 def track_records(report: Report) -> dict[str, str]:
@@ -210,6 +245,10 @@ def write_quality(report: Report, path: Path) -> dict:
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "fusion_weights": suggest_fusion_weights(report),
         "track_records": track_records(report),
+        # Only replaces the default once there's enough evidence.
+        "edge_bps_at_full_conviction": (
+            estimate_edge_bps(report) if len(report.edge_moves) >= MIN_SAMPLES else DEFAULT_EDGE_BPS
+        ),
         "news_sources": {
             n: {
                 "signals": s.signals,
@@ -300,6 +339,24 @@ def render(report: Report, current: dict[str, float]) -> str:
         )
     if not report.news_sources:
         lines.append("no LLM signals recorded yet")
+    if report.models:
+        lines += [
+            "",
+            "ANALYST MODELS (same scoring as news sources)",
+            "---------------------------------------------",
+            f"{'model':<28}{'signals':>8}{'dir':>5}{'scored':>7}{'hit%':>6}{'adj%':>6}"
+            f"{'bps 30m':>9}",
+        ]
+        for name, m in sorted(report.models.items()):
+            lines.append(
+                f"{name[:27]:<28}{m.signals:>8}{m.directional:>5}{m.scored:>7}"
+                f"{_fmt(m.hit_rate, '>6.0%')}{shrunk_rate(m.hits, m.scored):>6.0%}"
+                f"{_fmt(m.avg_bps(HIT_HORIZON), '>9.1f')}"
+            )
+        lines.append(
+            f"estimated edge at full conviction: {estimate_edge_bps(report):.1f} bps "
+            f"from {len(report.edge_moves)} scored signals (default {DEFAULT_EDGE_BPS:.0f})"
+        )
     lines += [
         "",
         f"adj% = hit rate shrunk toward 50% ({PRIOR_N} pseudo-observations). "

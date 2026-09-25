@@ -31,6 +31,7 @@ from pathlib import Path
 
 from .broker.sim import SimBroker
 from .config import RiskLimits, risk_limits_from_env
+from .costs import CostModel
 from .engine import Engine
 from .events import Event, event_ts, read_events
 from .journal import Journal
@@ -160,6 +161,8 @@ async def run_backtest(
     order_ttl: float = 2.0,
     fusion_weights: dict[str, float] | None = None,
     journal_path: Path | None = None,
+    edge_bps: float = 50.0,
+    cost_safety_multiple: float = 2.0,
 ) -> BacktestResult:
     if not events:
         raise ValueError("no events to replay")
@@ -170,11 +173,19 @@ async def run_backtest(
         fusion.weights = fusion_weights
     risk = RiskManager(limits, clock=clock)
     broker = SimBroker(commission_per_share=commission_per_share, min_commission=min_commission)
+    costs = CostModel(per_share=commission_per_share, minimum=min_commission)
     # Decisions are stamped in simulated time, so the journal reads like a live one.
     journal = Journal(journal_path, clock=clock) if journal_path else None
     engine = Engine(
         broker,
-        FusedSignalStrategy(symbols, hub, fusion),
+        FusedSignalStrategy(
+            symbols,
+            hub,
+            fusion,
+            costs=costs,
+            edge_bps_at_full_conviction=edge_bps,
+            cost_safety_multiple=cost_safety_multiple,
+        ),
         risk,
         order_ttl=order_ttl,
         clock=clock,
@@ -263,6 +274,13 @@ def main() -> None:
     parser.add_argument("--commission", type=float, default=0.0035, help="$ per share")
     parser.add_argument("--min-commission", type=float, default=0.35)
     parser.add_argument(
+        "--edge-bps",
+        type=float,
+        default=50.0,
+        help="expected move of a full-conviction view, for the cost check",
+    )
+    parser.add_argument("--cost-safety", type=float, default=2.0)
+    parser.add_argument(
         "--no-session",
         action="store_true",
         help="trade around the clock instead of the 09:35-15:50 ET session",
@@ -303,6 +321,8 @@ def main() -> None:
             commission_per_share=args.commission,
             min_commission=args.min_commission,
             journal_path=args.journal,
+            edge_bps=args.edge_bps,
+            cost_safety_multiple=args.cost_safety,
         )
     )
     print(f"symbols: {' '.join(symbols)}   events: {len(events):,}")

@@ -65,6 +65,8 @@ def live_trading_allowed() -> bool:
 @dataclass(frozen=True)
 class DataConfig:
     analyst_model: str = "claude-opus-5"
+    # Cheaper model for routine news/social batches; empty = use analyst_model for all.
+    analyst_routine_model: str = "claude-sonnet-5"
     analyst_effort: str = "medium"
     news_poll_seconds: float = 60.0
     ibkr_news: bool = True
@@ -79,6 +81,7 @@ def data_config_from_env() -> DataConfig:
     d = DataConfig()
     return DataConfig(
         analyst_model=_env("ANALYST_MODEL", d.analyst_model),
+        analyst_routine_model=_env("ANALYST_ROUTINE_MODEL", d.analyst_routine_model),
         analyst_effort=_env("ANALYST_EFFORT", d.analyst_effort),
         news_poll_seconds=float(_env("NEWS_POLL_SECONDS", str(d.news_poll_seconds))),
         ibkr_news=_env("IBKR_NEWS", "yes").strip().lower() == "yes",
@@ -109,4 +112,26 @@ def runtime_config_from_env() -> RuntimeConfig:
         session_flatten=_env("SESSION_FLATTEN", d.session_flatten),
         journal_file=_env("JOURNAL_FILE", d.journal_file),
         quality_file=_env("QUALITY_FILE", d.quality_file),
+    )
+
+
+@dataclass(frozen=True)
+class CostConfig:
+    commission_per_share: float = 0.0035
+    commission_min: float = 0.35
+    extra_fees_per_share: float = 0.0
+    # Expected move (bps) of a full-conviction view; replaced by the journal report's
+    # estimate once source_quality.json has one.
+    edge_bps: float = 50.0
+    safety_multiple: float = 2.0
+
+
+def cost_config_from_env() -> CostConfig:
+    d = CostConfig()
+    return CostConfig(
+        commission_per_share=float(_env("COMMISSION_PER_SHARE", str(d.commission_per_share))),
+        commission_min=float(_env("COMMISSION_MIN", str(d.commission_min))),
+        extra_fees_per_share=float(_env("EXTRA_FEES_PER_SHARE", str(d.extra_fees_per_share))),
+        edge_bps=float(_env("EDGE_BPS_FULL_CONVICTION", str(d.edge_bps))),
+        safety_multiple=float(_env("COST_SAFETY_MULTIPLE", str(d.safety_multiple))),
     )

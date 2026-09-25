@@ -97,9 +97,42 @@ Ctrl-C cancels the agent's working orders and disconnects.
 | SEC EDGAR | `SEC_USER_AGENT` (name + email, required by the SEC) | 8-K/6-K: main document and EX-99 exhibits (press releases), capped at 20k characters with a visible truncation marker. Form 4: insider, role, each buy/sell with size and price, 10b5-1 flag. 10-Q/10-K/13D/G: metadata only |
 | Finnhub | `FINNHUB_API_KEY` | Free tier: 60 calls/min, enough for ~60 symbols at the default 60s poll |
 | Reddit | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Official OAuth API; r/wallstreetbets, r/stocks, r/investing |
-| Claude | `ANTHROPIC_API_KEY` | `ANALYST_MODEL` (default `claude-opus-5`), `ANALYST_EFFORT` (default `medium`) |
+| Claude | `ANTHROPIC_API_KEY` | `ANALYST_MODEL` (default `claude-opus-5`) for SEC filings and pre-open briefings; `ANALYST_ROUTINE_MODEL` (default `claude-sonnet-5`, empty to disable) for everything else; `ANALYST_EFFORT` (default `medium`) |
 
-The analyst makes one Claude call per symbol per poll, and only when that symbol has new items.
+**News schedule** (paper/live):
+
+| When (ET, weekdays) | Poll every | What happens |
+|---|---|---|
+| 09:20 – 15:50 | 60 s | New items are analysed as they arrive (one call per symbol with new items) |
+| 04:00 – 09:20, 15:50 – 20:00 | 5 min | Items are collected, not analysed |
+| Overnight, weekends | 30 min | Items are collected, not analysed |
+| 09:20 | once | **Pre-open briefing**: one call per symbol over everything collected since the close (up to 100 items), on the main model |
+
+Off-hours news can't be traded until the open, and by then the opening price partly
+reflects it. So it's analysed once, in context, rather than item by item overnight. This
+also keeps Claude costs to trading hours plus one call per symbol per day.
+
+**Model routing:** routine newswire, IBKR and Reddit batches go to Sonnet 5 ($2/$10 per
+million tokens vs $5/$25 for Opus 5). Batches containing an SEC filing, and the pre-open
+briefings, go to Opus 5. If Sonnet declines to answer, the batch is retried on Opus. The
+journal records which model produced each signal. The report's "ANALYST MODELS" table
+compares their hit rates, so you can check the cheaper model holds up.
+
+### How positions are opened, sized and closed
+
+- **Only a Claude view can open a position.** The microstructure signals (book imbalance,
+  mean reversion) can enlarge an entry or change its timing. They can't create a
+  position, flip one, or lift a view that's too weak on its own over the entry threshold.
+- **Cost check:** an order that adds exposure is sent only if its expected gain covers
+  the round-trip commission `COST_SAFETY_MULTIPLE` times (default 2). Expected gain is
+  shares x price x |conviction| x `EDGE_BPS_FULL_CONVICTION` (default 50 bps). The report
+  replaces that default with an estimate from real signal outcomes once there's enough
+  data. Commissions default to IBKR Tiered ($0.0035/share, $0.35 minimum; see
+  `COMMISSION_*`). Orders that reduce exposure are never blocked.
+- **Anti-churn:** exits follow the Claude view alone, not the order book. A position is
+  reduced only once that view has fallen to half the position or less, going straight to
+  flat when the rest would be under 20% of the maximum position. Target changes smaller
+  than that are ignored.
 
 ## Safety
 
@@ -137,6 +170,9 @@ python -m trading_agent.report --trade 42        # everything behind one trade
 python -m trading_agent.report --since 2026-09-01
 python -m trading_agent.report --write           # update data/source_quality.json
 ```
+
+It also compares the analyst models and estimates the edge a full-conviction view has
+been worth. `--write` saves that estimate for the cost check.
 
 The report scores the **fusion sources** (`llm`, `micro:imbalance`, `micro:reversion`) on
 the trades they supported. It scores the **news sources** (e.g. `edgar`,

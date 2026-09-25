@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS trade_attribution (
 );
 CREATE TABLE IF NOT EXISTS signals (
     id TEXT PRIMARY KEY, ts REAL, symbol TEXT, source TEXT, score REAL,
-    confidence REAL, ttl REAL, rationale TEXT
+    confidence REAL, ttl REAL, rationale TEXT, model TEXT
 );
 CREATE TABLE IF NOT EXISTS signal_inputs (
     signal_id TEXT, news_id TEXT, news_source TEXT, headline TEXT, url TEXT,
@@ -121,6 +121,9 @@ class Journal:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(path))
         self.db.executescript(SCHEMA)
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(signals)")}
+        if "model" not in columns:  # journals created before model routing
+            self.db.execute("ALTER TABLE signals ADD COLUMN model TEXT")
         self._clock = clock
         self._commit_interval = commit_interval
         self._last_commit = 0.0
@@ -279,7 +282,8 @@ class Journal:
         if not signal.id:
             return
         self.db.execute(
-            "INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO signals (id, ts, symbol, source, score, confidence, ttl,"
+            " rationale, model) VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 signal.id,
                 signal.ts,
@@ -289,6 +293,7 @@ class Journal:
                 signal.confidence,
                 signal.ttl,
                 signal.rationale,
+                signal.model,
             ),
         )
         drivers = set(signal.drivers)

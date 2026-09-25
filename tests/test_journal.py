@@ -223,3 +223,39 @@ def test_report_scores_sources_and_suggests_weights(tmp_path):
     assert "edgar" in text and "FUSION SOURCES" in text
     detail = render_trade(db, 1)
     assert "ENTRY decision" in detail and "headline n0" in detail
+
+
+def test_report_compares_models_and_estimates_edge(tmp_path):
+    from trading_agent.report import DEFAULT_EDGE_BPS, estimate_edge_bps
+
+    db_path = tmp_path / "j.db"
+    clock = Clock()
+    j = Journal(db_path, clock=clock)
+    for k in range(40):
+        model = "claude-sonnet-5" if k % 2 else "claude-opus-5"
+        sig = Signal(
+            "AAPL",
+            "llm:news",
+            1.0,
+            1.0,
+            clock.t,
+            3600,
+            "",
+            id=f"s{k}",
+            inputs=(f"n{k}",),
+            drivers=(f"n{k}",),
+            model=model,
+        )
+        j.record_signal(sig, [news(f"n{k}", "finnhub/Reuters")])
+        j.on_tick(Tick("AAPL", 99.99, 100.01, 100.0, clock.t))
+        j.on_tick(Tick("AAPL", 100.99, 101.01, 101.0, clock.t + 1801))  # +100 bps
+        clock.t += 4000
+    j.close()
+    report = build_report(sqlite3.connect(db_path))
+    assert set(report.models) == {"claude-opus-5", "claude-sonnet-5"}
+    assert report.models["claude-sonnet-5"].hits == 20
+    # Full-strength signals (x0.6 weight) moved 100 bps: ~167 bps per unit conviction,
+    # shrunk toward the 50 bps default.
+    edge = estimate_edge_bps(report)
+    assert DEFAULT_EDGE_BPS < edge < 100 / 0.6
+    assert "ANALYST MODELS" in render(report, DEFAULT_WEIGHTS)
