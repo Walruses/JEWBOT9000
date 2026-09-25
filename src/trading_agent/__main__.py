@@ -20,11 +20,15 @@ from .config import (
     ib_config_from_env,
     live_trading_allowed,
     risk_limits_from_env,
+    runtime_config_from_env,
 )
 from .engine import Engine
+from .events import Recorder
 from .pipeline import NewsPipeline
 from .risk import RiskManager
+from .session import TradingSession, parse_hhmm
 from .signals import SignalFusion, SignalHub
+from .state import StateStore
 from .strategy import FusedSignalStrategy
 
 log = logging.getLogger("trading_agent")
@@ -75,7 +79,25 @@ async def run(args: argparse.Namespace) -> None:
     hub = SignalHub()
     fusion = SignalFusion(hub, max_position=limits.max_position)
     broker = build_broker(args.mode)
-    engine = Engine(broker, FusedSignalStrategy(args.symbols, hub, fusion), risk)
+
+    rt = runtime_config_from_env()
+    state_store = StateStore(rt.state_file if args.mode != "sim" else "data/state-sim.json")
+    if args.clear_halt:
+        _clear_halt(state_store)
+    # The simulator's synthetic prices run around the clock; real markets don't.
+    session = None
+    if args.mode != "sim":
+        session = TradingSession(parse_hhmm(rt.session_start), parse_hhmm(rt.session_flatten))
+    recorder = Recorder(rt.record_dir) if args.record else None
+
+    engine = Engine(
+        broker,
+        FusedSignalStrategy(args.symbols, hub, fusion),
+        risk,
+        session=session,
+        state_store=state_store,
+        recorder=recorder,
+    )
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -88,7 +110,12 @@ async def run(args: argparse.Namespace) -> None:
 
         analyst = ClaudeAnalyst(model=data_cfg.analyst_model, effort=data_cfg.analyst_effort)
         pipeline = NewsPipeline(
-            sources, analyst, hub, args.symbols, poll_interval=data_cfg.news_poll_seconds
+            sources,
+            analyst,
+            hub,
+            args.symbols,
+            poll_interval=data_cfg.news_poll_seconds,
+            recorder=recorder,
         )
         log.info("news sources: %s", ", ".join(s.name for s in sources))
 
@@ -107,7 +134,19 @@ async def run(args: argparse.Namespace) -> None:
             pipeline_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await pipeline_task
+        if recorder:
+            recorder.close()
         log.info("stopped; realized=%.2f total=%.2f", risk.realized_pnl, risk.total_pnl())
+
+
+def _clear_halt(store: StateStore) -> None:
+    from datetime import date
+
+    state = store.load(date.today())
+    if state.halted:
+        log.warning("clearing halt: %s", state.halt_reason)
+        state.halted, state.halt_reason = False, ""
+        store.save(state)
 
 
 def main() -> None:
@@ -115,6 +154,12 @@ def main() -> None:
     parser.add_argument("--mode", choices=["sim", "paper", "live"], default="sim")
     parser.add_argument("--symbols", nargs="+", default=["AAPL"])
     parser.add_argument("--no-news", action="store_true", help="disable the LLM news pipeline")
+    parser.add_argument(
+        "--record", action="store_true", help="record ticks, news and signals for backtesting"
+    )
+    parser.add_argument(
+        "--clear-halt", action="store_true", help="resume after a halt (after investigating it)"
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     logging.basicConfig(

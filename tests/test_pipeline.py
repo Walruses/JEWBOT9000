@@ -28,7 +28,7 @@ class RecordingAnalyst:
     def __init__(self):
         self.batches = []
 
-    async def analyze(self, symbol, items):
+    async def analyze(self, symbol, items, now=None):
         self.batches.append((symbol, [i.id for i in items]))
         return Signal(symbol, "llm:news", 0.5, 0.5, NOW, 600)
 

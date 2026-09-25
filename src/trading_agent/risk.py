@@ -37,6 +37,7 @@ class RiskManager:
         self.realized_pnl = 0.0
         self.halted = False
         self.halt_reason = ""
+        self.allow_flatten = False
 
     def _pos(self, symbol: str) -> Position:
         return self._positions.setdefault(symbol, Position())
@@ -44,15 +45,41 @@ class RiskManager:
     def position(self, symbol: str) -> int:
         return self._pos(symbol).qty
 
-    def halt(self, reason: str) -> None:
+    def positions(self) -> dict[str, int]:
+        return {sym: p.qty for sym, p in self._positions.items() if p.qty}
+
+    def set_position(self, symbol: str, qty: int, avg_price: float) -> None:
+        """Overwrite a position from the broker (startup reconciliation)."""
+        p = self._pos(symbol)
+        p.qty = qty
+        p.avg_price = avg_price if qty else 0.0
+
+    def restore(self, realized_pnl: float, halted: bool, halt_reason: str) -> None:
+        """Restore today's state after a restart so the daily-loss limit can't be reset
+        by restarting the process."""
+        self.realized_pnl = realized_pnl
+        if halted:
+            # Flattening is allowed after a restart: positions were just loaded from the broker.
+            self.halt(halt_reason or "halted before restart", allow_flatten=True)
+        self._check_loss()
+
+    def reset_day(self) -> None:
+        """New trading day: realized PnL starts from zero. A halt stays in force."""
+        self.realized_pnl = 0.0
+
+    def halt(self, reason: str, allow_flatten: bool = False) -> None:
+        """Stop trading. With allow_flatten, orders that only reduce positions toward flat
+        are still accepted (used for the loss limit; a halt caused by an untrustworthy
+        position view must not trade at all)."""
         if not self.halted:
             log.critical("TRADING HALTED: %s", reason)
+            self.allow_flatten = allow_flatten
         self.halted = True
         self.halt_reason = reason
 
     def check(self, intent: OrderIntent, mid: float) -> tuple[bool, str]:
         lim = self.limits
-        if self.halted:
+        if self.halted and not (self.allow_flatten and self._reduces(intent)):
             return False, f"halted: {self.halt_reason}"
         if intent.qty <= 0:
             return False, "non-positive quantity"
@@ -71,7 +98,8 @@ class RiskManager:
             worst = p.qty + p.pending_buy + intent.qty
         else:
             worst = p.qty - p.pending_sell - intent.qty
-        if abs(worst) > lim.max_position:
+        # Orders that shrink an oversized position (e.g. one inherited at startup) are allowed.
+        if abs(worst) > lim.max_position and abs(worst) >= abs(p.qty):
             return False, f"worst-case position {worst} exceeds {lim.max_position}"
 
         now = self._clock()
@@ -80,6 +108,12 @@ class RiskManager:
         if len(self._order_times) >= lim.max_orders_per_sec:
             return False, "order rate limit"
         return True, ""
+
+    def _reduces(self, intent: OrderIntent) -> bool:
+        p = self._pos(intent.symbol)
+        if intent.side is Side.SELL:
+            return p.qty > 0 and p.qty - p.pending_sell - intent.qty >= 0
+        return p.qty < 0 and p.qty + p.pending_buy + intent.qty <= 0
 
     def on_submit(self, intent: OrderIntent) -> None:
         self._order_times.append(self._clock())
@@ -94,6 +128,10 @@ class RiskManager:
         self._release_pending(self._pos(symbol), side, unfilled_qty)
 
     def on_fill(self, fill: Fill) -> None:
+        self.realized_pnl -= fill.commission
+        if fill.qty == 0:  # commission-only report
+            self._check_loss()
+            return
         p = self._pos(fill.symbol)
         self._release_pending(p, fill.side, fill.qty)
 
@@ -130,7 +168,7 @@ class RiskManager:
 
     def _check_loss(self) -> None:
         if self.total_pnl() <= -self.limits.max_daily_loss:
-            self.halt(f"daily loss limit hit (pnl={self.total_pnl():.2f})")
+            self.halt(f"daily loss limit hit (pnl={self.total_pnl():.2f})", allow_flatten=True)
 
     @staticmethod
     def _release_pending(p: Position, side: Side, qty: int) -> None:

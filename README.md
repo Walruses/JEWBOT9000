@@ -45,6 +45,8 @@ and trades through Interactive Brokers. Every order passes pre-trade risk checks
 | `pipeline.py` | Slow loop: polls sources, de-duplicates, drops items older than 1h, runs the analyst |
 | `signals/` | `SignalHub` (TTL and decay), `MicrostructureSignals`, `SignalFusion` (weighted to a target position) |
 | `strategy/` | `FusedSignalStrategy` works each symbol toward its target with passive limit orders |
+| `session.py`, `state.py` | Trading hours / end-of-day flattening; daily PnL and halt persisted across restarts |
+| `events.py`, `backtest.py`, `download.py` | Recording format, replay backtester, IBKR history downloader |
 | `risk.py` | Pre-trade checks, position and PnL tracking, kill switch |
 | `engine.py` | Order lifecycle: one working order per symbol, stale-order cancels, halt handling |
 | `broker/` | `IBKRBroker` (ib_async) and `SimBroker` (offline, fills conservatively) |
@@ -66,14 +68,32 @@ python -m trading_agent --mode paper --symbols AAPL MSFT   # IBKR paper account
 python -m trading_agent --mode live  --symbols AAPL        # real money (see below)
 ```
 
-`--no-news` turns off the LLM pipeline. Ctrl-C cancels all working orders and disconnects.
+`--no-news` turns off the LLM pipeline and `--record` saves everything for backtesting.
+Ctrl-C cancels the agent's working orders and disconnects.
+
+### Trading day and restarts
+
+- **Session** (paper/live): new positions only between `SESSION_START` (09:35 ET) and
+  `SESSION_FLATTEN` (15:50 ET). After that the agent works every position back to flat
+  with marketable limit orders before the 16:00 close, and places nothing outside hours.
+  Holidays and half days aren't modelled.
+- **Startup:** cancels orders left over from a previous run (this client ID's orders
+  only, never ones you placed by hand) and loads current IBKR positions for the traded
+  symbols. Holdings in other symbols are ignored.
+- **Reconciliation:** every 15s the agent compares its positions with IBKR's. A mismatch
+  that persists across two checks with no orders in flight halts trading completely.
+- **Saved state** (`STATE_FILE`, default `data/state.json`): today's realized PnL and any
+  halt survive a restart, so restarting can't reset the daily-loss limit. A halt carries
+  over to the next day. Resume with `--clear-halt` once you've investigated it.
+- **Daily-loss halt:** cancels everything, then only accepts orders that reduce positions
+  toward flat, so a losing position isn't carried overnight.
 
 ### Data sources
 
 | Source | Needs | Notes |
 |---|---|---|
 | IBKR news | Paper/live mode, IBKR news subscriptions | Headlines from whatever providers your account has enabled |
-| SEC EDGAR | `SEC_USER_AGENT` (name + email, required by the SEC) | 8-K / 10-Q / 10-K / Form 4 / 13D/G metadata and 8-K item codes |
+| SEC EDGAR | `SEC_USER_AGENT` (name + email, required by the SEC) | 8-K/6-K: main document and EX-99 exhibits (press releases), capped at 20k characters with a visible truncation marker. Form 4: insider, role, each buy/sell with size and price, 10b5-1 flag. 10-Q/10-K/13D/G: metadata only |
 | Finnhub | `FINNHUB_API_KEY` | Free tier: 60 calls/min, enough for ~60 symbols at the default 60s poll |
 | Reddit | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Official OAuth API; r/wallstreetbets, r/stocks, r/investing |
 | Claude | `ANTHROPIC_API_KEY` | `ANALYST_MODEL` (default `claude-opus-5`), `ANALYST_EFFORT` (default `medium`) |
@@ -86,11 +106,40 @@ The analyst makes one Claude call per symbol per poll, and only when that symbol
   needs both `--mode live` and `TRADING_ALLOW_LIVE=yes`.
 - **Risk limits** (`RISK_*` in `.env`): max position (counting working orders as filled),
   max order size and notional, max distance from mid, orders/sec, and a daily-loss limit
-  that halts trading and cancels every working order.
+  that halts trading, cancels working orders and flattens.
 - **Untrusted text.** News and social posts are untrusted input to the LLM, and its output
   moves money. So the output is schema-constrained, numbers are clamped, and the prompt
   treats embedded instructions as data. Fusion weights cap the LLM's influence (0.6 by
   default), and risk limits bound the book whatever any signal says.
+
+## Backtesting
+
+The backtester replays events through the same engine, strategy, fusion and risk code
+used live. Only the broker and the clock are simulated.
+
+```bash
+# 1. Data: record your own sessions (best: exact quotes with sizes, plus the LLM signals
+#    the agent actually produced) ...
+python -m trading_agent --mode paper --symbols AAPL MSFT --record   # -> data/recordings/
+# ... or download history from IBKR (1-second quotes) plus news from EDGAR/Finnhub/IBKR
+python -m trading_agent.download --symbols AAPL MSFT --date 2026-09-24   # -> data/history/
+
+# 2. Replay
+python -m trading_agent.backtest data/recordings/2026-09-24.jsonl        # recorded signals
+python -m trading_agent.backtest data/history/2026-09-24.jsonl --reanalyze --equity-csv eq.csv
+```
+
+- `--reanalyze` runs Claude over the recorded news on a simulated 60s poll. Each signal
+  becomes usable only after `--latency` seconds (default 10). Results are cached in
+  `data/analysis_cache.jsonl`, so re-runs are free and deterministic.
+- **Lookahead bias:** a model asked about past news may already know how the story ended.
+  Treat `--reanalyze` results for dates the model could know about as optimistic. Signals
+  recorded live don't have this problem.
+- **Fill model:** resting orders fill only when the opposite side trades through the
+  limit (conservative for entries). There's no queue position, partial fills or market
+  impact, and commissions default to IBKR's fixed $0.0035/share, $0.35 minimum.
+- Downloaded 1-second bars have no book sizes, so the imbalance signal is inactive in
+  those backtests (`download --ticks` gets sizes but is only practical for short windows).
 
 ## Development
 
@@ -101,14 +150,10 @@ ruff check src tests && ruff format src tests
 
 ## Known gaps / next steps
 
-- **Backtesting.** The strategy and sources run live only. Recording ticks and news and
-  replaying them through `SimBroker` is the next step before tuning weights.
-- **Filing contents.** EDGAR items carry metadata only. Fetching the 8-K exhibits (e.g.
-  EX-99.1 press releases) would give the analyst much more to work with.
-- **End-of-day flattening**, short-sale locate checks, and persistence of positions and PnL
-  across restarts. On startup, reconcile with IBKR positions.
-- **Order-book depth** (IBKR L2) for better microstructure signals, and X/Twitter (paid API).
-- The IBKR adapter and live Claude calls are covered by type-level wiring only; test them
-  on a paper account before relying on them.
+- **Validate on paper.** The IBKR adapter, downloader and live Claude calls are tested
+  only against fakes. Run on a paper account and watch the reconciliation logs.
+- **Tune with backtests.** Fusion weights, thresholds and position sizes are placeholders.
+- Short-sale locate/borrow checks, exchange holiday calendar, IBKR L2 depth for better
+  microstructure signals, X/Twitter (paid API).
 
 This software can lose money. Nothing here is investment advice.

@@ -88,3 +88,21 @@ def data_config_from_env() -> DataConfig:
         reddit_client_secret=_env("REDDIT_CLIENT_SECRET", ""),
         reddit_user_agent=_env("REDDIT_USER_AGENT", "trading-agent/0.1"),
     )
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    state_file: str = "data/state.json"
+    record_dir: str = "data/recordings"
+    session_start: str = "09:35"
+    session_flatten: str = "15:50"
+
+
+def runtime_config_from_env() -> RuntimeConfig:
+    d = RuntimeConfig()
+    return RuntimeConfig(
+        state_file=_env("STATE_FILE", d.state_file),
+        record_dir=_env("RECORD_DIR", d.record_dir),
+        session_start=_env("SESSION_START", d.session_start),
+        session_flatten=_env("SESSION_FLATTEN", d.session_flatten),
+    )

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import time
+from datetime import UTC, datetime
 
 import httpx
 
@@ -19,13 +20,20 @@ class FinnhubSource:
         self._client = client or httpx.AsyncClient(timeout=10.0)
 
     async def fetch(self, symbols: list[str]) -> list[NewsItem]:
-        today = datetime.now(UTC).date()
-        params = {"from": str(today - timedelta(days=1)), "to": str(today), "token": self._api_key}
+        now = time.time()
+        return await self.fetch_between(symbols, now - 86400, now)
+
+    async def fetch_between(self, symbols: list[str], start: float, end: float) -> list[NewsItem]:
+        params = {
+            "from": str(datetime.fromtimestamp(start, UTC).date()),
+            "to": str(datetime.fromtimestamp(end, UTC).date()),
+            "token": self._api_key,
+        }
         items: list[NewsItem] = []
         for sym in symbols:
             resp = await self._client.get(NEWS_URL, params={**params, "symbol": sym})
             resp.raise_for_status()
-            items.extend(self.parse(sym, resp.json()))
+            items.extend(i for i in self.parse(sym, resp.json()) if start <= i.published_at <= end)
         return items
 
     def parse(self, symbol: str, rows: list[dict]) -> list[NewsItem]:

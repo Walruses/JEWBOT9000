@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 
 from ..broker.ibkr import IBKRBroker
 from ..models import NewsItem
@@ -24,6 +24,17 @@ class IBKRNewsSource:
         self._providers = ""
 
     async def fetch(self, symbols: list[str]) -> list[NewsItem]:
+        return await self._fetch(symbols, "", "", self.per_symbol)
+
+    async def fetch_between(self, symbols: list[str], start: float, end: float) -> list[NewsItem]:
+        return await self._fetch(
+            symbols,
+            datetime.fromtimestamp(start, UTC),
+            datetime.fromtimestamp(end, UTC),
+            300,  # IBKR's maximum per request
+        )
+
+    async def _fetch(self, symbols: list[str], start, end, limit: int) -> list[NewsItem]:
         ib = self.broker.ib
         if not self._providers:
             providers = await ib.reqNewsProvidersAsync()
@@ -37,7 +48,7 @@ class IBKRNewsSource:
             if contract is None:
                 continue
             result = await ib.reqHistoricalNewsAsync(
-                contract.conId, self._providers, "", "", self.per_symbol
+                contract.conId, self._providers, start, end, limit
             )
             rows = result if isinstance(result, list) else [result] if result else []
             for row in rows:

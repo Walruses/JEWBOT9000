@@ -24,7 +24,21 @@ class _SimOrder:
 
 
 class SimBroker:
-    def __init__(self, synthetic_feed: bool = False, tick_interval: float = 0.01, seed: int = 0):
+    def __init__(
+        self,
+        synthetic_feed: bool = False,
+        tick_interval: float = 0.01,
+        seed: int = 0,
+        commission_per_share: float = 0.0,
+        min_commission: float = 0.0,
+    ):
+        self.commission_per_share = commission_per_share
+        self.min_commission = min_commission
+        self.fees_paid = 0.0
+        self.fill_count = 0
+        self.shares_traded = 0
+        self._positions: dict[str, int] = {}
+        self._avg: dict[str, float] = {}
         self._orders: dict[str, _SimOrder] = {}
         self._ids = itertools.count(1)
         self._on_tick: TickCallback | None = None
@@ -39,6 +53,9 @@ class SimBroker:
     async def disconnect(self) -> None:
         if self._feed_task:
             self._feed_task.cancel()
+
+    async def positions(self) -> dict[str, tuple[int, float]]:
+        return {s: (q, self._avg.get(s, 0.0)) for s, q in self._positions.items() if q}
 
     async def subscribe(self, symbols: list[str], on_tick: TickCallback) -> None:
         self._on_tick = on_tick
@@ -74,10 +91,27 @@ class SimBroker:
             )
             if crossed:
                 del self._orders[oid]
-                order.on_fill(Fill(oid, it.symbol, it.side, it.qty, it.limit_price, tick.ts))
+                fee = max(self.min_commission, self.commission_per_share * it.qty)
+                self._book(it)
+                self.fees_paid += fee
+                self.fill_count += 1
+                self.shares_traded += it.qty
+                order.on_fill(Fill(oid, it.symbol, it.side, it.qty, it.limit_price, tick.ts, fee))
                 order.on_done(oid, 0)
         if self._on_tick:
             self._on_tick(tick)
+
+    def _book(self, it: OrderIntent) -> None:
+        old = self._positions.get(it.symbol, 0)
+        new = old + it.side.sign * it.qty
+        if new == 0:
+            self._avg[it.symbol] = 0.0
+        elif old == 0 or (old > 0) != (new > 0):
+            self._avg[it.symbol] = it.limit_price
+        elif abs(new) > abs(old):
+            avg = self._avg.get(it.symbol, 0.0)
+            self._avg[it.symbol] = (avg * abs(old) + it.limit_price * it.qty) / abs(new)
+        self._positions[it.symbol] = new
 
     async def _random_walk(self, symbols: list[str]) -> None:
         mids = {s: 100.0 for s in symbols}

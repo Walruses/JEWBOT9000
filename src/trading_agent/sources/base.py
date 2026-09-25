@@ -14,3 +14,9 @@ class NewsSource(Protocol):
         """Return recent items for the given symbols. Duplicates across calls are fine;
         the pipeline de-duplicates on NewsItem.id."""
         ...
+
+
+class HistoricalSource(NewsSource, Protocol):
+    async def fetch_between(self, symbols: list[str], start: float, end: float) -> list[NewsItem]:
+        """Items published between two epoch timestamps (used to build backtest data)."""
+        ...

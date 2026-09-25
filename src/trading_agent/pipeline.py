@@ -17,7 +17,15 @@ log = logging.getLogger(__name__)
 
 
 class Analyst(Protocol):
-    async def analyze(self, symbol: str, items: list[NewsItem]) -> Signal | None: ...
+    async def analyze(
+        self, symbol: str, items: list[NewsItem], now: float | None = None
+    ) -> Signal | None: ...
+
+
+class EventRecorder(Protocol):
+    def news(self, item: NewsItem) -> None: ...
+
+    def signal(self, signal: Signal) -> None: ...
 
 
 class NewsPipeline:
@@ -31,6 +39,7 @@ class NewsPipeline:
         max_item_age: float = 3600.0,
         max_concurrent_analyses: int = 4,
         clock: Callable[[], float] = time.time,
+        recorder: EventRecorder | None = None,
     ):
         self.sources = sources
         self.analyst = analyst
@@ -39,6 +48,7 @@ class NewsPipeline:
         self.poll_interval = poll_interval
         self.max_item_age = max_item_age
         self._clock = clock
+        self.recorder = recorder
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._seen_cap = 50_000
         self._sem = asyncio.Semaphore(max_concurrent_analyses)
@@ -65,6 +75,8 @@ class NewsPipeline:
                 if item.id in self._seen:
                     continue
                 self._mark_seen(item.id)
+                if self.recorder:
+                    self.recorder.news(item)
                 # Old items are already priced in; this also stops a restart from
                 # trading on the backlog.
                 if item.published_at >= cutoff:
@@ -76,6 +88,8 @@ class NewsPipeline:
         published = [s for s in signals if s is not None]
         for sig in published:
             self.hub.publish(sig)
+            if self.recorder:
+                self.recorder.signal(sig)
             log.info(
                 "signal %s %s score=%+.2f conf=%.2f ttl=%.0fs: %s",
                 sig.symbol,
@@ -90,7 +104,7 @@ class NewsPipeline:
     async def _analyze(self, symbol: str, items: list[NewsItem]) -> Signal | None:
         async with self._sem:
             try:
-                return await self.analyst.analyze(symbol, items)
+                return await self.analyst.analyze(symbol, items, now=self._clock())
             except Exception:
                 log.exception("analysis failed for %s", symbol)
                 return None

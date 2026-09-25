@@ -92,8 +92,10 @@ class ClaudeAnalyst:
         self.model = model
         self.effort = effort
 
-    async def analyze(self, symbol: str, items: list[NewsItem]) -> Signal | None:
-        now = time.time()
+    async def analyze(
+        self, symbol: str, items: list[NewsItem], now: float | None = None
+    ) -> Signal | None:
+        now = time.time() if now is None else now
         try:
             response = await self.client.beta.messages.create(
                 model=self.model,

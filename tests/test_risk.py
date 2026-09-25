@@ -63,9 +63,39 @@ def test_pnl_through_flip():
     assert risk.unrealized_pnl() == 5.0
 
 
-def test_daily_loss_halts_trading():
+def test_daily_loss_halt_allows_only_reducing_orders():
     risk, _ = make(max_daily_loss=50)
     risk.on_fill(fill(Side.BUY, 10, 100.0))
     risk.update_mark("AAPL", 94.0)
+    assert risk.halted and risk.allow_flatten
+    assert not risk.check(buy(1, px=94.0), 94.0)[0]
+    assert not risk.check(sell(11, px=94.0), 94.0)[0]  # would flip short
+    assert risk.check(sell(10, px=94.0), 94.0)[0]
+
+
+def test_hard_halt_blocks_everything():
+    risk, _ = make()
+    risk.on_fill(fill(Side.BUY, 10, 100.0))
+    risk.halt("position mismatch")
+    assert not risk.check(sell(10), 100.0)[0]
+
+
+def test_commissions_reduce_realized_pnl():
+    risk, _ = make()
+    risk.on_fill(Fill("1", "AAPL", Side.BUY, 10, 100.0, 0.0, commission=0.35))
+    risk.on_fill(Fill("1", "AAPL", Side.BUY, 0, 0.0, 0.0, commission=0.15))  # report only
+    assert risk.position("AAPL") == 10
+    assert risk.realized_pnl == -0.5
+
+
+def test_can_reduce_an_oversized_inherited_position():
+    risk, _ = make(max_position=100, max_order_qty=100)
+    risk.set_position("AAPL", 150, 100.0)
+    assert not risk.check(buy(1), 100.0)[0]
+    assert risk.check(sell(10), 100.0)[0]
+
+
+def test_restore_reapplies_loss_limit():
+    risk, _ = make(max_daily_loss=50)
+    risk.restore(-60.0, halted=False, halt_reason="")
     assert risk.halted
-    assert not risk.check(sell(1, px=94.0), 94.0)[0]

@@ -46,12 +46,16 @@ class OrderIntent:
 
 @dataclass(frozen=True, slots=True)
 class Fill:
+    """An execution. Brokers that report commissions separately (IBKR) send a follow-up
+    Fill with qty=0 carrying only the commission."""
+
     order_id: str
     symbol: str
     side: Side
     qty: int
     price: float
     ts: float
+    commission: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

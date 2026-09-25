@@ -98,8 +98,14 @@ class IBKRBroker:
                 self._trades.pop(oid, None)
                 on_done(oid, int(t.remaining()))
 
+        def commission_handler(_trade: Trade, _fill, report) -> None:
+            fee = _num(report.commission)
+            if fee:
+                on_fill(Fill(oid, intent.symbol, intent.side, 0, 0.0, time.time(), fee))
+
         trade.fillEvent += fill_handler
         trade.statusEvent += status_handler
+        trade.commissionReportEvent += commission_handler
         return oid
 
     def cancel(self, order_id: str) -> None:
@@ -108,7 +114,23 @@ class IBKRBroker:
             self.ib.cancelOrder(trade.order)
 
     def cancel_all(self) -> None:
-        self.ib.reqGlobalCancel()
+        # Only this client's orders -- also catches ones left over from a crashed run, which
+        # IBKR re-reports on connect. reqGlobalCancel would kill manually placed orders too.
+        for trade in self.ib.openTrades():
+            if trade.order.clientId == self.config.client_id and not trade.isDone():
+                self.ib.cancelOrder(trade.order)
+
+    async def positions(self) -> dict[str, tuple[int, float]]:
+        out: dict[str, tuple[int, float]] = {}
+        for pos in self.ib.positions():
+            if pos.contract.secType != "STK":
+                continue
+            qty, avg = out.get(pos.contract.symbol, (0, 0.0))
+            new_qty = qty + int(pos.position)
+            # avgCost for stocks is per share (including commissions).
+            new_avg = (avg * qty + pos.avgCost * pos.position) / new_qty if new_qty else 0.0
+            out[pos.contract.symbol] = (new_qty, new_avg)
+        return out
 
     def _on_error(self, req_id: int, code: int, message: str, *_: object) -> None:
         log.warning("IBKR error reqId=%s code=%s: %s", req_id, code, message)
