@@ -53,6 +53,41 @@ and trades through Interactive Brokers. Every order passes pre-trade risk checks
 | `engine.py` | Order lifecycle: one working order per symbol, stale-order cancels, halt handling |
 | `broker/` | `IBKRBroker` (ib_async) and `SimBroker` (offline, fills conservatively) |
 
+## Starting paper trading
+
+The agent runs on your own machine or a small server, next to IB Gateway. It needs to
+stay up during market hours; one in a US-East datacenter is ideal.
+
+1. **IBKR paper account.** In Client Portal, go to Settings > Paper Trading Account:
+   - **Reset the paper balance** to your planned amount (e.g. $25,000–$30,000). Paper
+     accounts often start at $1,000,000, and positions are sized from the real balance.
+   - **Share your live account's market data** with the paper account. Without real-time
+     US stock data the agent sees no quotes. IBKR news feeds also depend on your
+     subscriptions.
+2. **IB Gateway** (or TWS), logged in to the **paper** account. Under Configure > API >
+   Settings: enable socket clients, port 4002, turn "Read-Only API" off, and allow
+   127.0.0.1. Gateway logs out daily; IBC (github.com/IbcAlpha/IBC) can automate
+   re-login.
+3. **Install:** `python3 -m venv .venv && .venv/bin/pip install -e .`, then
+   `cp .env.example .env` and fill in:
+   - `ANTHROPIC_API_KEY` and `SEC_USER_AGENT` (name + email) at minimum.
+   - `FINNHUB_API_KEY` and the Reddit app credentials if you want those sources.
+   - Keep `ACCOUNT_EQUITY` equal to the paper balance and `TRADING_ALLOW_LIVE=no`.
+4. **Check:** `python -m trading_agent.preflight --symbols AAPL` checks:
+   - the IBKR connection, and that it's a paper account
+   - the account size
+   - live quotes and news providers
+   - every API key
+   Fix anything marked `[FAIL]`. Paper mode also refuses to start unless IBKR reports a
+   paper account (IDs starting with "D").
+5. **Start:** `scripts/paper.sh`. It builds `data/watchlist.txt` from IBKR's scanners if
+   it doesn't exist, runs the pre-flight checks, and starts the agent with recording on,
+   logging to `logs/`. Run it inside tmux or screen so it keeps going when you log out.
+6. **Every trading day after 16:10 ET:** read `data/reviews/<date>/summary.md`. Then run
+   `python -m trading_agent.review analyze --date <date>` and `python -m trading_agent.report`.
+   Apply only the parameter changes you agree with (see "Daily review and the training
+   period").
+
 ## Setup
 
 ```bash

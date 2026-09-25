@@ -22,13 +22,19 @@ log = logging.getLogger(__name__)
 OTC_EXCHANGES = frozenset({"PINK", "OTC", "OTCBB", "OTCQB", "OTCQX", "GREY", "EXPERT"})
 
 
+def is_paper_account(account_id: str) -> bool:
+    return account_id.upper().startswith("D")
+
+
 def _num(x: float | None) -> float:
     return 0.0 if x is None or math.isnan(x) else float(x)
 
 
 class IBKRBroker:
-    def __init__(self, config: IBConfig):
+    def __init__(self, config: IBConfig, expect_paper: bool = False):
         self.config = config
+        # Refuse to run unless IBKR reports only paper accounts (IDs start with "D").
+        self.expect_paper = expect_paper
         self.ib = IB()
         self._contracts: dict[str, Stock] = {}
         self._trades: dict[str, Trade] = {}
@@ -36,8 +42,21 @@ class IBKRBroker:
     async def connect(self) -> None:
         c = self.config
         await self.ib.connectAsync(c.host, c.port, clientId=c.client_id)
+        accounts = list(self.ib.managedAccounts())
+        if self.expect_paper and not all(is_paper_account(a) for a in accounts):
+            self.ib.disconnect()
+            raise RuntimeError(
+                f"paper mode, but IBKR reports account(s) {accounts}: paper account IDs "
+                "start with 'D'. Log IB Gateway/TWS into the paper account."
+            )
         self.ib.errorEvent += self._on_error
-        log.info("connected to IBKR %s:%s (client %s)", c.host, c.port, c.client_id)
+        log.info(
+            "connected to IBKR %s:%s (client %s), accounts %s",
+            c.host,
+            c.port,
+            c.client_id,
+            accounts,
+        )
 
     def contract(self, symbol: str) -> Stock | None:
         """Qualified contract for a subscribed symbol (used by the IBKR news source)."""

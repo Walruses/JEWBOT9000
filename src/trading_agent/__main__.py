@@ -66,7 +66,7 @@ def build_broker(mode: str, costs: CostModel | None = None):
             sys.exit("live mode requires TRADING_ALLOW_LIVE=yes")
         if not cfg.is_live_port:
             sys.exit(f"live mode requested but port {cfg.port} is not a live TWS/Gateway port")
-    return IBKRBroker(cfg)
+    return IBKRBroker(cfg, expect_paper=mode == "paper")
 
 
 def build_sources(cfg: DataConfig, broker) -> list:
