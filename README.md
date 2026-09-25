@@ -47,6 +47,7 @@ and trades through Interactive Brokers. Every order passes pre-trade risk checks
 | `strategy/` | `FusedSignalStrategy` works each symbol toward its target with passive limit orders |
 | `session.py`, `state.py` | Trading hours / end-of-day flattening; daily PnL and halt persisted across restarts |
 | `events.py`, `backtest.py`, `download.py` | Recording format, replay backtester, IBKR history downloader |
+| `journal.py`, `report.py` | Trade journal (SQLite) and per-source performance report / weight updates |
 | `risk.py` | Pre-trade checks, position and PnL tracking, kill switch |
 | `engine.py` | Order lifecycle: one working order per symbol, stale-order cancels, halt handling |
 | `broker/` | `IBKRBroker` (ib_async) and `SimBroker` (offline, fills conservatively) |
@@ -111,6 +112,50 @@ The analyst makes one Claude call per symbol per poll, and only when that symbol
   moves money. So the output is schema-constrained, numbers are clamped, and the prompt
   treats embedded instructions as data. Fusion weights cap the LLM's influence (0.6 by
   default), and risk limits bound the book whatever any signal says.
+
+## Trade journal and source quality
+
+Every run writes to `data/journal.db` (SQLite; `JOURNAL_FILE`). It records:
+
+- **every order decision** with the full reasoning behind it: each active signal's
+  score, confidence, decay, weight and contribution, plus the resulting conviction and
+  target
+- **every fill** with its commission, linked to its decision
+- **every round-trip trade** (flat -> position -> flat) with entry/exit prices, gross and
+  net PnL and fees, and the decisions that opened and closed it
+- **attribution**: each trade's net PnL split across the signal sources that supported
+  its entry, in proportion to their contribution. Sources that pointed the other way get
+  no credit.
+- **every Claude signal** with its rationale and the news items it read. Claude now
+  names which items drove its view, so credit goes to the right source.
+- **signal outcomes**: the price move 1, 5, 30 and 60 minutes after each signal, so news
+  sources are judged on every prediction, not only the few that became trades
+
+```bash
+python -m trading_agent.report                   # performance + source scorecards
+python -m trading_agent.report --trade 42        # everything behind one trade
+python -m trading_agent.report --since 2026-09-01
+python -m trading_agent.report --write           # update data/source_quality.json
+```
+
+The report scores the **fusion sources** (`llm`, `micro:imbalance`, `micro:reversion`) on
+the trades they supported. It scores the **news sources** (e.g. `edgar`,
+`finnhub/Reuters`, `reddit/r/wallstreetbets`, `ibkr/BRFG`) on the hit rate and average
+move of the signals they drove, plus their attributed PnL.
+
+**Closing the loop.** `--write` saves suggested fusion weights and each news source's track
+record. The agent loads that file on its next start:
+- **weights:** the suggested weights replace the defaults.
+- **track records:** Claude sees each item's record next to it, e.g.
+  `track_record="right 31 of 44 past calls (70%)"`.
+
+Suggestions are shrunk toward neutral and move off the defaults only after 10 supported
+trades per source. They're capped at 0.25x-2x and always computed from the defaults, so
+re-running doesn't compound. Attribution is correlational: a source that often agrees
+with a good one looks good too. Review the report before writing.
+
+Backtests can journal too (`--journal data/backtest.db`), which gives you source
+scorecards over historical data.
 
 ## Backtesting
 

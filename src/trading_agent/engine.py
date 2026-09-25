@@ -29,6 +29,18 @@ class TickRecorder(Protocol):
     def tick(self, tick: Tick) -> None: ...
 
 
+class TradeJournal(Protocol):
+    def record_decision(
+        self, intent: OrderIntent, mid: float, reason: str, context: dict
+    ) -> int: ...
+
+    def on_fill(self, fill: Fill, decision_id: int | None) -> None: ...
+
+    def on_tick(self, tick: Tick) -> None: ...
+
+    def seed_position(self, symbol: str, qty: int, avg_price: float) -> None: ...
+
+
 @dataclass
 class WorkingOrder:
     intent: OrderIntent
@@ -48,6 +60,7 @@ class Engine:
         state_store: StateStore | None = None,
         recorder: TickRecorder | None = None,
         reconcile_interval: float = 15.0,
+        journal: TradeJournal | None = None,
     ):
         self.broker = broker
         self.strategy = strategy
@@ -56,6 +69,7 @@ class Engine:
         self.session = session
         self.state_store = state_store
         self.recorder = recorder
+        self.journal = journal
         self.reconcile_interval = reconcile_interval
         self._clock = clock
         self.working: dict[str, WorkingOrder] = {}
@@ -96,6 +110,8 @@ class Engine:
         for sym in self.strategy.symbols:
             qty, avg = held.get(sym, (0, 0.0))
             self.risk.set_position(sym, qty, avg)
+            if qty and self.journal:
+                self.journal.seed_position(sym, qty, avg)
             if qty:
                 log.warning("starting with existing position %s %+d @ %.4f", sym, qty, avg)
         others = sorted(set(held) - set(self.strategy.symbols))
@@ -144,6 +160,8 @@ class Engine:
     def on_tick(self, tick: Tick) -> None:
         if self.recorder:
             self.recorder.tick(tick)
+        if self.journal:
+            self.journal.on_tick(tick)
         if not tick.valid:
             return
         self._roll_day()
@@ -166,7 +184,7 @@ class Engine:
             self._flatten(tick)
             return
         for intent in self.strategy.on_tick(tick, self.risk.position(tick.symbol)):
-            self._submit(intent, tick.mid)
+            self._submit(intent, tick.mid, "strategy")
 
     def _flatten(self, tick: Tick) -> None:
         qty = self.risk.position(tick.symbol)
@@ -178,17 +196,26 @@ class Engine:
         else:
             intent = OrderIntent(tick.symbol, Side.BUY, -qty, tick.ask)
         log.info("flattening %s: %s %d", tick.symbol, intent.side.value, intent.qty)
-        self._submit(intent, tick.mid)
+        self._submit(intent, tick.mid, "halt_flatten" if self.risk.halted else "eod_flatten")
 
     # ---- orders ----------------------------------------------------------------------
 
-    def _submit(self, intent: OrderIntent, mid: float) -> None:
-        ok, reason = self.risk.check(intent, mid)
+    def _submit(self, intent: OrderIntent, mid: float, reason: str) -> None:
+        ok, why = self.risk.check(intent, mid)
         if not ok:
-            log.debug("rejected %s: %s", intent, reason)
+            log.debug("rejected %s: %s", intent, why)
             return
         self.risk.on_submit(intent)
         closed = False
+        decision_id = None
+        if self.journal:
+            context = self.strategy.explain(intent.symbol) if reason == "strategy" else {}
+            decision_id = self.journal.record_decision(intent, mid, reason, context)
+
+        def on_fill(fill: Fill) -> None:
+            if self.journal:
+                self.journal.on_fill(fill, decision_id)
+            self._on_fill(fill)
 
         def on_done(order_id: str, unfilled_qty: int) -> None:
             nonlocal closed
@@ -197,7 +224,7 @@ class Engine:
             self.risk.on_order_closed(intent.symbol, intent.side, unfilled_qty)
 
         try:
-            oid = self.broker.place_limit(intent, self._on_fill, on_done)
+            oid = self.broker.place_limit(intent, on_fill, on_done)
         except Exception:
             log.exception("order placement failed: %s", intent)
             self.risk.on_order_closed(intent.symbol, intent.side, intent.qty)

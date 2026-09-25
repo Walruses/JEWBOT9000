@@ -28,6 +28,10 @@ class EventRecorder(Protocol):
     def signal(self, signal: Signal) -> None: ...
 
 
+class SignalJournal(Protocol):
+    def record_signal(self, signal: Signal, items: list[NewsItem]) -> None: ...
+
+
 class NewsPipeline:
     def __init__(
         self,
@@ -40,6 +44,7 @@ class NewsPipeline:
         max_concurrent_analyses: int = 4,
         clock: Callable[[], float] = time.time,
         recorder: EventRecorder | None = None,
+        journal: SignalJournal | None = None,
     ):
         self.sources = sources
         self.analyst = analyst
@@ -49,6 +54,7 @@ class NewsPipeline:
         self.max_item_age = max_item_age
         self._clock = clock
         self.recorder = recorder
+        self.journal = journal
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._seen_cap = 50_000
         self._sem = asyncio.Semaphore(max_concurrent_analyses)
@@ -82,11 +88,15 @@ class NewsPipeline:
                 if item.published_at >= cutoff:
                     new_by_symbol[item.symbol].append(item)
 
-        signals = await asyncio.gather(
-            *(self._analyze(sym, items) for sym, items in new_by_symbol.items())
-        )
-        published = [s for s in signals if s is not None]
-        for sig in published:
+        batches = list(new_by_symbol.items())
+        signals = await asyncio.gather(*(self._analyze(sym, items) for sym, items in batches))
+        published = []
+        for (_, items), sig in zip(batches, signals, strict=True):
+            if sig is None:
+                continue
+            published.append(sig)
+            if self.journal:
+                self.journal.record_signal(sig, items)
             self.hub.publish(sig)
             if self.recorder:
                 self.recorder.signal(sig)

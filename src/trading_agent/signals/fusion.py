@@ -30,6 +30,24 @@ class SignalFusion:
             total += self.weight(sig.source) * sig.confidence * decay * sig.score
         return max(-1.0, min(1.0, total))
 
+    def breakdown(self, symbol: str) -> list[dict]:
+        """Each active signal's contribution to conviction, for the trade journal."""
+        rows = []
+        for sig, decay in self.hub.active(symbol):
+            weight = self.weight(sig.source)
+            rows.append(
+                {
+                    "source": sig.source,
+                    "signal_id": sig.id,
+                    "score": round(sig.score, 4),
+                    "confidence": round(sig.confidence, 4),
+                    "decay": round(decay, 4),
+                    "weight": weight,
+                    "contribution": round(weight * sig.confidence * decay * sig.score, 6),
+                }
+            )
+        return rows
+
     def target_position(self, symbol: str) -> int:
         c = self.conviction(symbol)
         if abs(c) < self.entry_threshold:

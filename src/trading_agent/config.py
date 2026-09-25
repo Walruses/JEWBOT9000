@@ -96,6 +96,8 @@ class RuntimeConfig:
     record_dir: str = "data/recordings"
     session_start: str = "09:35"
     session_flatten: str = "15:50"
+    journal_file: str = "data/journal.db"
+    quality_file: str = "data/source_quality.json"
 
 
 def runtime_config_from_env() -> RuntimeConfig:
@@ -105,4 +107,6 @@ def runtime_config_from_env() -> RuntimeConfig:
         record_dir=_env("RECORD_DIR", d.record_dir),
         session_start=_env("SESSION_START", d.session_start),
         session_flatten=_env("SESSION_FLATTEN", d.session_flatten),
+        journal_file=_env("JOURNAL_FILE", d.journal_file),
+        quality_file=_env("QUALITY_FILE", d.quality_file),
     )

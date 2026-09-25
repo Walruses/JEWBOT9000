@@ -33,6 +33,7 @@ from .broker.sim import SimBroker
 from .config import RiskLimits, risk_limits_from_env
 from .engine import Engine
 from .events import Event, event_ts, read_events
+from .journal import Journal
 from .models import NewsItem, Signal, Tick
 from .pipeline import Analyst, NewsPipeline
 from .risk import RiskManager
@@ -158,6 +159,7 @@ async def run_backtest(
     min_commission: float = 0.35,
     order_ttl: float = 2.0,
     fusion_weights: dict[str, float] | None = None,
+    journal_path: Path | None = None,
 ) -> BacktestResult:
     if not events:
         raise ValueError("no events to replay")
@@ -168,6 +170,8 @@ async def run_backtest(
         fusion.weights = fusion_weights
     risk = RiskManager(limits, clock=clock)
     broker = SimBroker(commission_per_share=commission_per_share, min_commission=min_commission)
+    # Decisions are stamped in simulated time, so the journal reads like a live one.
+    journal = Journal(journal_path, clock=clock) if journal_path else None
     engine = Engine(
         broker,
         FusedSignalStrategy(symbols, hub, fusion),
@@ -175,6 +179,7 @@ async def run_backtest(
         order_ttl=order_ttl,
         clock=clock,
         session=session,
+        journal=journal,
     )
     await broker.subscribe(symbols, engine.on_tick)
 
@@ -188,8 +193,10 @@ async def run_backtest(
             symbols,
             poll_interval=poll_interval,
             clock=clock,
+            journal=journal,
         )
     next_poll = clock.t
+    news_by_id = {e.id: e for e in events if isinstance(e, NewsItem)}
 
     signals_used = 0
     peak = equity = 0.0
@@ -215,6 +222,12 @@ async def run_backtest(
         elif isinstance(event, Signal) and pipeline is None and event.symbol in wanted:
             hub.publish(event)
             signals_used += 1
+            if journal:
+                inputs = [news_by_id[i] for i in event.inputs if i in news_by_id]
+                journal.record_signal(event, inputs)
+
+    if journal:
+        journal.close()
 
     return BacktestResult(
         realized_pnl=risk.realized_pnl,
@@ -255,6 +268,11 @@ def main() -> None:
         help="trade around the clock instead of the 09:35-15:50 ET session",
     )
     parser.add_argument("--equity-csv", type=Path)
+    parser.add_argument(
+        "--journal",
+        type=Path,
+        help="write a trade journal (then: python -m trading_agent.report --db PATH)",
+    )
     parser.add_argument("--log-level", default="WARNING")
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s %(name)s: %(message)s")
@@ -284,6 +302,7 @@ def main() -> None:
             poll_interval=args.poll,
             commission_per_share=args.commission,
             min_commission=args.min_commission,
+            journal_path=args.journal,
         )
     )
     print(f"symbols: {' '.join(symbols)}   events: {len(events):,}")

@@ -95,3 +95,50 @@ def test_reanalyze_respects_latency_and_caches(tmp_path):
         )
     )
     assert fake2.calls == [] and cached.calls == 0
+
+
+def test_backtest_journal_links_trade_to_signal(tmp_path):
+    import sqlite3
+
+    news = NewsItem("n1", "edgar", "AAPL", "guidance raised", T0 + 2)
+    sig = Signal(
+        "AAPL",
+        "llm:news",
+        1.0,
+        1.0,
+        T0 + 5,
+        4 * 3600,
+        "raised",
+        id="s1",
+        inputs=("n1",),
+        drivers=("n1",),
+    )
+    events = [
+        *ticks(T0, 5),
+        news,
+        sig,
+        *ticks(T0 + 6, 1, bid=100.00),
+        *ticks(T0 + 7, 3, bid=99.98),
+        *ticks(datetime(2026, 9, 24, 15, 51, tzinfo=NEW_YORK).timestamp(), 5, bid=101.00),
+    ]
+    events.sort(key=lambda e: e.ts if not isinstance(e, NewsItem) else e.published_at)
+    db_path = tmp_path / "j.db"
+    asyncio.run(
+        run_backtest(
+            events,
+            ["AAPL"],
+            RiskLimits(max_position=10, max_daily_loss=1e9),
+            commission_per_share=0.0,
+            min_commission=0.0,
+            fusion_weights=LLM_ONLY,
+            journal_path=db_path,
+        )
+    )
+    db = sqlite3.connect(db_path)
+    assert db.execute("SELECT net_pnl FROM trades").fetchall() == [(10.0,)]
+    assert db.execute("SELECT source, signal_id, share FROM trade_attribution").fetchall() == [
+        ("llm:news", "s1", 1.0)
+    ]
+    assert db.execute("SELECT news_source, driver FROM signal_inputs").fetchall() == [("edgar", 1)]
+    reasons = [r[0] for r in db.execute("SELECT reason FROM decisions ORDER BY id")]
+    assert reasons == ["strategy", "eod_flatten"]

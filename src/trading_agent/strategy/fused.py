@@ -22,6 +22,13 @@ class FusedSignalStrategy(Strategy):
         self.micro = micro or MicrostructureSignals()
         self.min_trade_qty = min_trade_qty
 
+    def explain(self, symbol: str) -> dict:
+        return {
+            "conviction": round(self.fusion.conviction(symbol), 6),
+            "target": self.fusion.target_position(symbol),
+            "signals": self.fusion.breakdown(symbol),
+        }
+
     def on_tick(self, tick: Tick, position: int) -> list[OrderIntent]:
         if tick.symbol not in self.symbols or not tick.valid:
             return []

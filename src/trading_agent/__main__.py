@@ -24,6 +24,7 @@ from .config import (
 )
 from .engine import Engine
 from .events import Recorder
+from .journal import Journal
 from .pipeline import NewsPipeline
 from .risk import RiskManager
 from .session import TradingSession, parse_hhmm
@@ -89,6 +90,17 @@ async def run(args: argparse.Namespace) -> None:
     if args.mode != "sim":
         session = TradingSession(parse_hhmm(rt.session_start), parse_hhmm(rt.session_flatten))
     recorder = Recorder(rt.record_dir) if args.record else None
+    journal = Journal(rt.journal_file if args.mode != "sim" else "data/journal-sim.db")
+
+    # Source quality from `python -m trading_agent.report --write`, if it exists.
+    from pathlib import Path
+
+    from .report import load_quality
+
+    quality = load_quality(Path(rt.quality_file)) or {}
+    if quality.get("fusion_weights"):
+        fusion.weights = dict(quality["fusion_weights"])
+        log.info("fusion weights from %s: %s", rt.quality_file, fusion.weights)
 
     engine = Engine(
         broker,
@@ -97,6 +109,7 @@ async def run(args: argparse.Namespace) -> None:
         session=session,
         state_store=state_store,
         recorder=recorder,
+        journal=journal,
     )
 
     loop = asyncio.get_running_loop()
@@ -108,7 +121,11 @@ async def run(args: argparse.Namespace) -> None:
     if sources:
         from .analyst import ClaudeAnalyst
 
-        analyst = ClaudeAnalyst(model=data_cfg.analyst_model, effort=data_cfg.analyst_effort)
+        analyst = ClaudeAnalyst(
+            model=data_cfg.analyst_model,
+            effort=data_cfg.analyst_effort,
+            track_records=quality.get("track_records"),
+        )
         pipeline = NewsPipeline(
             sources,
             analyst,
@@ -116,6 +133,7 @@ async def run(args: argparse.Namespace) -> None:
             args.symbols,
             poll_interval=data_cfg.news_poll_seconds,
             recorder=recorder,
+            journal=journal,
         )
         log.info("news sources: %s", ", ".join(s.name for s in sources))
 
@@ -136,6 +154,7 @@ async def run(args: argparse.Namespace) -> None:
                 await pipeline_task
         if recorder:
             recorder.close()
+        journal.close()
         log.info("stopped; realized=%.2f total=%.2f", risk.realized_pnl, risk.total_pnl())
 
 

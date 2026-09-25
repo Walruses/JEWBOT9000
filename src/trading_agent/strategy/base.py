@@ -20,5 +20,9 @@ class Strategy(ABC):
     def on_tick(self, tick: Tick, position: int) -> list[OrderIntent]:
         """Return orders to place given the latest tick and current position."""
 
+    def explain(self, symbol: str) -> dict:
+        """What the strategy based its latest decision on; stored with each order."""
+        return {}
+
     def on_fill(self, fill: Fill) -> None:  # noqa: B027 - optional hook
         """Called for every execution of an order this strategy requested."""

@@ -32,6 +32,8 @@ def decode(line: str) -> Event:
         raw.pop("ts", None)
         return NewsItem(**raw)
     if kind == "signal":
+        raw["inputs"] = tuple(raw.get("inputs", ()))
+        raw["drivers"] = tuple(raw.get("drivers", ()))
         return Signal(**raw)
     raise ValueError(f"unknown event type {kind!r}")
 

@@ -73,6 +73,11 @@ class Signal:
     ts: float
     ttl: float
     rationale: str = ""
+    # For journal attribution: a unique id, the news items analysed, and the ones the
+    # analyst said drove its view.
+    id: str = ""
+    inputs: tuple[str, ...] = ()
+    drivers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
