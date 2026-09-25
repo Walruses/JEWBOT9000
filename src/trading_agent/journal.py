@@ -67,7 +67,30 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     signal_id TEXT, horizon REAL, base_mid REAL, mid REAL, ret_bps REAL,
     directional_bps REAL, PRIMARY KEY (signal_id, horizon)
 );
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY, started_at REAL, ended_at REAL, mode TEXT, symbols TEXT,
+    config TEXT, code_version TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY, ts REAL, run_id INTEGER, kind TEXT, symbol TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS skipped (
+    id INTEGER PRIMARY KEY, ts REAL, symbol TEXT, stage TEXT, reason TEXT, side TEXT,
+    qty INTEGER, mid REAL, context TEXT, repeats INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id INTEGER PRIMARY KEY, ts REAL, symbol TEXT, model TEXT, note TEXT, prompt TEXT,
+    response TEXT, stop_reason TEXT, input_tokens INTEGER, output_tokens INTEGER,
+    latency_s REAL, signal_id TEXT, error TEXT
+);
+CREATE TABLE IF NOT EXISTS bars (
+    symbol TEXT, minute REAL, open REAL, high REAL, low REAL, close REAL, spread_bps REAL,
+    bid_size REAL, ask_size REAL, ticks INTEGER, PRIMARY KEY (symbol, minute)
+);
 CREATE INDEX IF NOT EXISTS idx_attr_trade ON trade_attribution(trade_id);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_skipped_ts ON skipped(ts);
+CREATE INDEX IF NOT EXISTS idx_llm_ts ON llm_calls(ts);
 CREATE INDEX IF NOT EXISTS idx_inputs_signal ON signal_inputs(signal_id);
 """
 
@@ -99,6 +122,47 @@ class _OpenTrade:
 
 
 @dataclass
+class _Bar:
+    minute: float
+    open: float
+    high: float = 0.0
+    low: float = float("inf")
+    close: float = 0.0
+    ticks: int = 0
+    spread_bps_sum: float = 0.0
+    bid_size_sum: float = 0.0
+    ask_size_sum: float = 0.0
+
+    def add(self, tick: Tick) -> None:
+        self.high = max(self.high, tick.mid)
+        self.low = min(self.low, tick.mid)
+        self.close = tick.mid
+        self.ticks += 1
+        self.spread_bps_sum += (tick.ask - tick.bid) / tick.mid * 10_000
+        self.bid_size_sum += tick.bid_size
+        self.ask_size_sum += tick.ask_size
+
+
+class JournalLogHandler(logging.Handler):
+    """Records warnings and errors from anywhere in the agent as journal events."""
+
+    def __init__(self, journal: Journal):
+        super().__init__(level=logging.WARNING)
+        self.journal = journal
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.journal.event(
+                "log",
+                level=record.levelname,
+                logger=record.name,
+                message=record.getMessage(),
+            )
+        except Exception:  # never let journaling break the agent
+            pass
+
+
+@dataclass
 class _PendingOutcome:
     signal_id: str
     symbol: str
@@ -121,9 +185,17 @@ class Journal:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(path))
         self.db.executescript(SCHEMA)
-        columns = {r[1] for r in self.db.execute("PRAGMA table_info(signals)")}
-        if "model" not in columns:  # journals created before model routing
-            self.db.execute("ALTER TABLE signals ADD COLUMN model TEXT")
+        # Columns added after the first release; older journals are upgraded in place.
+        for table, column, kind in (
+            ("signals", "model", "TEXT"),
+            ("signal_inputs", "body", "TEXT"),
+            ("trades", "exit_reason", "TEXT"),
+            ("trades", "tier", "TEXT"),
+            ("trades", "stop_pct", "REAL"),
+        ):
+            columns = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
         self._clock = clock
         self._commit_interval = commit_interval
         self._last_commit = 0.0
@@ -133,6 +205,86 @@ class Journal:
         self._open: dict[str, _OpenTrade] = {}
         self._last_closed: dict[str, int] = {}
         self._pending: dict[str, list[_PendingOutcome]] = {}
+        self._decision_reasons: OrderedDict[int, str] = OrderedDict()
+        self.run_id: int | None = None
+        self._bars: dict[str, _Bar] = {}
+        self._last_skip: dict[tuple[str, str, str], tuple[float, int]] = {}
+
+    # ---- runs, events, skipped decisions, LLM calls ---------------------------------
+
+    def start_run(self, mode: str, symbols: list[str], config: dict, code_version: str) -> int:
+        cur = self.db.execute(
+            "INSERT INTO runs (started_at, mode, symbols, config, code_version) VALUES (?,?,?,?,?)",
+            (self._clock(), mode, " ".join(symbols), json.dumps(config, default=str), code_version),
+        )
+        self.run_id = int(cur.lastrowid)
+        self.db.commit()
+        return self.run_id
+
+    def event(self, kind: str, symbol: str | None = None, **detail) -> None:
+        self.db.execute(
+            "INSERT INTO events (ts, run_id, kind, symbol, detail) VALUES (?,?,?,?,?)",
+            (self._clock(), self.run_id, kind, symbol, json.dumps(detail, default=str)),
+        )
+        self._maybe_commit()
+
+    def skipped(
+        self,
+        symbol: str,
+        stage: str,
+        reason: str,
+        intent: OrderIntent | None = None,
+        mid: float | None = None,
+        context: dict | None = None,
+        dedupe_seconds: float = 60.0,
+    ) -> None:
+        """A trade the agent wanted (or considered) but didn't make, and why. Identical
+        reasons for the same symbol within dedupe_seconds only bump a repeat counter,
+        so a blocked signal doesn't write a row per tick."""
+        key = (symbol, stage, "".join(c for c in reason if not c.isdigit())[:80])
+        now = self._clock()
+        last = self._last_skip.get(key)
+        if last and now - last[0] < dedupe_seconds:
+            self.db.execute("UPDATE skipped SET repeats = repeats + 1 WHERE id = ?", (last[1],))
+            return
+        cur = self.db.execute(
+            "INSERT INTO skipped (ts, symbol, stage, reason, side, qty, mid, context)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (
+                now,
+                symbol,
+                stage,
+                reason,
+                intent.side.value if intent else None,
+                intent.qty if intent else None,
+                mid,
+                json.dumps(context or {}, default=str),
+            ),
+        )
+        self._last_skip[key] = (now, int(cur.lastrowid))
+        self._maybe_commit()
+
+    def record_llm_call(self, **call) -> None:
+        self.db.execute(
+            "INSERT INTO llm_calls (ts, symbol, model, note, prompt, response, stop_reason,"
+            " input_tokens, output_tokens, latency_s, signal_id, error)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                call.get("ts", self._clock()),
+                call.get("symbol"),
+                call.get("model"),
+                call.get("note"),
+                call.get("prompt"),
+                call.get("response"),
+                call.get("stop_reason"),
+                call.get("input_tokens"),
+                call.get("output_tokens"),
+                call.get("latency_s"),
+                call.get("signal_id"),
+                call.get("error"),
+            ),
+        )
+        self._maybe_commit()
 
     # ---- decisions & fills -----------------------------------------------------------
 
@@ -155,8 +307,10 @@ class Journal:
         )
         decision_id = int(cur.lastrowid)
         self._decisions[decision_id] = context
+        self._decision_reasons[decision_id] = reason
         if len(self._decisions) > 10_000:
             self._decisions.popitem(last=False)
+            self._decision_reasons.popitem(last=False)
         self._maybe_commit()
         return decision_id
 
@@ -223,9 +377,13 @@ class Journal:
     def _close(self, t: _OpenTrade, ts: float) -> None:
         del self._open[t.symbol]
         net = t.gross - t.fees
+        last_exit = t.exits[-1][0] if t.exits else None
+        exit_reason = self._decision_reasons.get(last_exit, "unknown") if last_exit else "unknown"
+        entry_ctx = t.entries[0].context if t.entries else {}
         cur = self.db.execute(
             "INSERT INTO trades (symbol, direction, opened_at, closed_at, max_qty, avg_entry,"
-            " avg_exit, gross_pnl, fees, net_pnl, inherited) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " avg_exit, gross_pnl, fees, net_pnl, inherited, exit_reason, tier, stop_pct)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 t.symbol,
                 t.direction,
@@ -238,6 +396,9 @@ class Journal:
                 t.fees,
                 net,
                 int(t.inherited),
+                exit_reason,
+                entry_ctx.get("tier"),
+                entry_ctx.get("stop_pct"),
             ),
         )
         trade_id = int(cur.lastrowid)
@@ -298,9 +459,19 @@ class Journal:
         )
         drivers = set(signal.drivers)
         self.db.executemany(
-            "INSERT INTO signal_inputs VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO signal_inputs (signal_id, news_id, news_source, headline, url,"
+            " published_at, driver, body) VALUES (?,?,?,?,?,?,?,?)",
             [
-                (signal.id, i.id, i.source, i.headline, i.url, i.published_at, int(i.id in drivers))
+                (
+                    signal.id,
+                    i.id,
+                    i.source,
+                    i.headline,
+                    i.url,
+                    i.published_at,
+                    int(i.id in drivers),
+                    i.body,
+                )
                 for i in items
             ],
         )
@@ -310,6 +481,8 @@ class Journal:
         self._maybe_commit()
 
     def on_tick(self, tick: Tick) -> None:
+        if tick.valid:
+            self._update_bar(tick)
         pending = self._pending.get(tick.symbol)
         if not pending or not tick.valid:
             return
@@ -342,6 +515,36 @@ class Journal:
             pending.remove(p)
         self._maybe_commit()
 
+    # ---- price bars ------------------------------------------------------------------
+
+    def _update_bar(self, tick: Tick) -> None:
+        minute = tick.ts - tick.ts % 60
+        bar = self._bars.get(tick.symbol)
+        if bar is not None and bar.minute != minute:
+            self._write_bar(tick.symbol, bar)
+            bar = None
+        if bar is None:
+            bar = self._bars[tick.symbol] = _Bar(minute, tick.mid)
+        bar.add(tick)
+
+    def _write_bar(self, symbol: str, bar: _Bar) -> None:
+        n = bar.ticks
+        self.db.execute(
+            "INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                symbol,
+                bar.minute,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.spread_bps_sum / n,
+                bar.bid_size_sum / n,
+                bar.ask_size_sum / n,
+                n,
+            ),
+        )
+
     # ---- housekeeping ----------------------------------------------------------------
 
     def _maybe_commit(self) -> None:
@@ -351,6 +554,12 @@ class Journal:
             self._last_commit = now
 
     def close(self) -> None:
+        for symbol, bar in self._bars.items():
+            self._write_bar(symbol, bar)
+        if self.run_id is not None:
+            self.db.execute(
+                "UPDATE runs SET ended_at = ? WHERE id = ?", (self._clock(), self.run_id)
+            )
         self.db.commit()
         self.db.close()
 

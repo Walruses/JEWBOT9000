@@ -8,6 +8,7 @@ ML/AI signal model plugs in -- wrap the model in a Strategy subclass.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 from ..models import Fill, OrderIntent, Tick
 
@@ -15,6 +16,13 @@ from ..models import Fill, OrderIntent, Tick
 class Strategy(ABC):
     def __init__(self, symbols: list[str]):
         self.symbols = symbols
+        # (symbol, stage, reason, context) -> None; set by the engine to journal trades
+        # the strategy wanted but decided against (cost check, tier rules, ...).
+        self.skip_listener: Callable[[str, str, str, dict], None] | None = None
+
+    def _skip(self, symbol: str, stage: str, reason: str) -> None:
+        if self.skip_listener:
+            self.skip_listener(symbol, stage, reason, self.explain(symbol))
 
     @abstractmethod
     def on_tick(self, tick: Tick, position: int) -> list[OrderIntent]:

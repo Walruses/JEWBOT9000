@@ -41,6 +41,18 @@ class TradeJournal(Protocol):
 
     def seed_position(self, symbol: str, qty: int, avg_price: float) -> None: ...
 
+    def event(self, kind: str, symbol: str | None = None, **detail) -> None: ...
+
+    def skipped(
+        self,
+        symbol: str,
+        stage: str,
+        reason: str,
+        intent: OrderIntent | None = None,
+        mid: float | None = None,
+        context: dict | None = None,
+    ) -> None: ...
+
 
 @dataclass
 class WorkingOrder:
@@ -81,6 +93,12 @@ class Engine:
         self.stop_pct = stop_pct
         self._entry_stop: dict[str, float] = {}
         self._equity_at_open = account.config.starting_equity if account else 0.0
+        self._last_account_event = 0.0
+        self._flatten_logged: date | None = None
+        if journal:
+            strategy.skip_listener = lambda sym, stage, reason, ctx: journal.skipped(
+                sym, stage, reason, context=ctx
+            )
         self.reconcile_interval = reconcile_interval
         self._clock = clock
         self.working: dict[str, WorkingOrder] = {}
@@ -125,6 +143,7 @@ class Engine:
                 self.journal.seed_position(sym, qty, avg)
             if qty:
                 log.warning("starting with existing position %s %+d @ %.4f", sym, qty, avg)
+                self._event("inherited_position", sym, qty=qty, avg_price=avg)
         others = sorted(set(held) - set(self.strategy.symbols))
         if others:
             log.info("ignoring positions in symbols not traded by this agent: %s", others)
@@ -165,6 +184,7 @@ class Engine:
         """Compare our positions with the broker's. A mismatch that persists across two
         checks with no working orders means our view is wrong: halt rather than trade on it."""
         await self._refresh_account()
+        self._account_snapshot()
         try:
             held = await self.broker.positions()
         except Exception:
@@ -183,6 +203,7 @@ class Engine:
             log.warning(
                 "position mismatch %s: ours=%d broker=%d (strike %d)", sym, ours, theirs, strikes
             )
+            self._event("position_mismatch", sym, ours=ours, broker=theirs, strike=strikes)
             if strikes >= 2:
                 self.risk.halt(f"position mismatch on {sym}: ours={ours} broker={theirs}")
                 self._enforce_halt()
@@ -215,6 +236,9 @@ class Engine:
         if self._has_working(tick.symbol):
             return
         if phase is Phase.FLATTEN:
+            if self._flatten_logged != self._day:
+                self._flatten_logged = self._day
+                self._event("eod_flatten_start", positions=self.risk.positions())
             self._flatten(tick)
             return
         for intent in self.strategy.on_tick(tick, self.risk.position(tick.symbol)):
@@ -236,6 +260,15 @@ class Engine:
         cooldown = self.account.config.stop_cooldown_minutes * 60
         if tick.symbol not in self._stop_cooldown_until or not self._has_working(tick.symbol):
             log.warning("stop loss %s: %+d @ avg %.4f, mid %.4f", tick.symbol, qty, avg, tick.mid)
+            self._event(
+                "stop_loss",
+                tick.symbol,
+                position=qty,
+                avg_price=avg,
+                stop_pct=stop_frac * 100,
+                bid=tick.bid,
+                ask=tick.ask,
+            )
         self._stop_cooldown_until[tick.symbol] = self._clock() + cooldown
         for oid, w in list(self.working.items()):
             if w.intent.symbol == tick.symbol and not w.cancel_requested:
@@ -291,10 +324,15 @@ class Engine:
         mid = tick.mid
         ok, why = self.risk.check(intent, mid, tick.bid, tick.ask)
         opening = self._opens(intent)
+        stage = "risk"
         if ok and reason == "strategy":
+            stage = "account"
             ok, why = self._account_check(intent, opening)
         if not ok:
             log.debug("rejected %s: %s", intent, why)
+            if self.journal:
+                context = self.strategy.explain(intent.symbol) if reason == "strategy" else {}
+                self.journal.skipped(intent.symbol, stage, f"{reason}: {why}", intent, mid, context)
             return
         self.risk.on_submit(intent)
         closed = False
@@ -372,6 +410,12 @@ class Engine:
             )
             self.broker.cancel_all()
             self._save_state()
+            self._event(
+                "halt",
+                reason=self.risk.halt_reason,
+                flatten=self.risk.allow_flatten,
+                positions=self.risk.positions(),
+            )
         return True
 
     # ---- day / state -----------------------------------------------------------------
@@ -385,6 +429,7 @@ class Engine:
         today = self._trading_date(self._clock())
         if self._day is not None and today != self._day:
             log.info("new trading day %s (previous realized=%.2f)", today, self.risk.realized_pnl)
+            self._event("day_end", date=str(self._day), realized_pnl=self.risk.realized_pnl)
             if self.account:
                 # Without a broker report, carry the day's result into equity.
                 self._equity_at_open += self.risk.realized_pnl
@@ -395,6 +440,28 @@ class Engine:
             self._day = today
             self._save_state()
         self._day = today
+
+    def _event(self, kind: str, symbol: str | None = None, **detail) -> None:
+        if self.journal:
+            self.journal.event(kind, symbol, **detail)
+
+    def _account_snapshot(self, every: float = 300.0) -> None:
+        now = self._clock()
+        if now - self._last_account_event < every:
+            return
+        self._last_account_event = now
+        detail = {
+            "realized_pnl": self.risk.realized_pnl,
+            "unrealized_pnl": self.risk.unrealized_pnl(),
+            "positions": self.risk.positions(),
+            "halted": self.risk.halted,
+        }
+        if self.account and self._day:
+            detail |= {
+                "equity": self.account.equity,
+                "day_trades_remaining": self.account.day_trades_remaining(self._day),
+            }
+        self._event("account", **detail)
 
     def _save_state(self) -> None:
         if not self.state_store or self._day is None:

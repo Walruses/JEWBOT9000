@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -30,13 +31,16 @@ from .config import (
 from .costs import CostModel
 from .engine import Engine
 from .events import Recorder
-from .journal import Journal
+from .journal import Journal, JournalLogHandler
 from .pipeline import NewsPipeline, NewsSchedule
+from .review import DEFAULT_REVIEW_MODEL, code_version, post_close_loop
 from .risk import RiskManager
 from .session import TradingSession, parse_hhmm
 from .signals import SignalFusion, SignalHub
+from .signals.fusion import apply_env_overrides
 from .state import StateStore
 from .strategy import FusedSignalStrategy
+from .tuning import apply_to_environment
 
 log = logging.getLogger("trading_agent")
 
@@ -85,6 +89,7 @@ def build_sources(cfg: DataConfig, broker) -> list:
 
 
 async def run(args: argparse.Namespace) -> None:
+    tuned = apply_to_environment()
     limits = risk_limits_from_env()
     data_cfg = data_config_from_env()
     risk = RiskManager(limits)
@@ -116,8 +121,12 @@ async def run(args: argparse.Namespace) -> None:
     if quality.get("fusion_weights"):
         fusion.weights = dict(quality["fusion_weights"])
         log.info("fusion weights from %s: %s", rt.quality_file, fusion.weights)
+    # Approved tuned parameters (python -m trading_agent.review apply) win over the report.
+    apply_env_overrides(fusion)
 
     edge_bps = quality.get("edge_bps_at_full_conviction") or cost_cfg.edge_bps
+    if "EDGE_BPS_FULL_CONVICTION" in tuned:
+        edge_bps = cost_cfg.edge_bps
     account = AccountGuard(account_config_from_env())
     a = account.config
     log.info(
@@ -189,6 +198,7 @@ async def run(args: argparse.Namespace) -> None:
             track_records=quality.get("track_records"),
             routine_model=data_cfg.analyst_routine_model or None,
         )
+        analyst.call_log = journal.record_llm_call
         pipeline = NewsPipeline(
             sources,
             analyst,
@@ -217,17 +227,80 @@ async def run(args: argparse.Namespace) -> None:
     else:
         log.warning("no news sources configured: without LLM views no positions are opened")
 
+    # Snapshot of everything that shaped today's decisions, for the post-close review.
+    journal.start_run(
+        args.mode,
+        args.symbols,
+        run_config_snapshot(
+            limits=limits,
+            account=account.config,
+            costs=cost_cfg,
+            data=data_cfg,
+            runtime=rt,
+            fusion={"weights": fusion.weights, "entry_threshold": fusion.entry_threshold},
+            edge_bps=edge_bps,
+            universe={
+                "standard": universe.standard,
+                "penny": universe.penny,
+                "penny_below": universe.penny_below,
+                "min_price": universe.min_price,
+                "stop_vol_multiple": universe.stop_vol_multiple,
+            },
+            tuned=tuned,
+            quality=quality,
+            sources=[s.name for s in sources],
+        ),
+        code_version(),
+    )
+    log_handler = JournalLogHandler(journal)
+    logging.getLogger().addHandler(log_handler)
+
+    review_task = None
+    if session:
+        review_task = asyncio.create_task(
+            post_close_loop(
+                Path(rt.journal_file),
+                journal.db.commit,
+                auto_analyze=os.environ.get("REVIEW_AUTO_ANALYZE", "no").lower() == "yes",
+                model=os.environ.get("REVIEW_MODEL", DEFAULT_REVIEW_MODEL),
+            )
+        )
+
     try:
         await engine.run()
     finally:
-        if pipeline_task:
-            pipeline_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pipeline_task
+        for task in (pipeline_task, review_task):
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        logging.getLogger().removeHandler(log_handler)
         if recorder:
             recorder.close()
         journal.close()
         log.info("stopped; realized=%.2f total=%.2f", risk.realized_pnl, risk.total_pnl())
+
+
+SECRET_MARKERS = ("key", "secret", "token", "password")
+
+
+def run_config_snapshot(**parts) -> dict:
+    """Configuration as plain data, with API keys and other secrets removed."""
+    from dataclasses import asdict, is_dataclass
+
+    def clean(value):
+        if is_dataclass(value):
+            value = asdict(value)
+        if isinstance(value, dict):
+            return {
+                k: ("<redacted>" if any(m in str(k).lower() for m in SECRET_MARKERS) else clean(v))
+                for k, v in value.items()
+            }
+        if isinstance(value, list | tuple):
+            return [clean(v) for v in value]
+        return value
+
+    return clean(parts)
 
 
 async def _synthetic_views(hub: SignalHub, symbols: list[str]) -> None:

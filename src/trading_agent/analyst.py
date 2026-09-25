@@ -12,6 +12,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -134,6 +135,8 @@ class ClaudeAnalyst:
         self.effort = effort
         # news source -> human-readable track record, from the journal report
         self.track_records = track_records or {}
+        # Receives every API call (prompt, response, tokens, latency) for the journal.
+        self.call_log: Callable[..., None] | None = None
 
     def pick_model(self, items: list[NewsItem], note: str = "") -> str:
         if not self.routine_model or note:
@@ -150,30 +153,60 @@ class ClaudeAnalyst:
         if note:
             prompt = f"{note}\n\n{prompt}"
         model = self.pick_model(items, note)
+        call = {"ts": now, "symbol": symbol, "note": note, "prompt": prompt}
         try:
-            response = await self._request(model, prompt)
+            response = await self._timed(call, model, prompt)
             if response.stop_reason == "refusal" and model != self.model:
                 log.warning("%s declined %s; retrying on %s", model, symbol, self.model)
+                self._log_call(call, response)
+                call = {**call, "note": f"{note} (retry after refusal)".strip()}
                 model = self.model
-                response = await self._request(model, prompt)
+                response = await self._timed(call, model, prompt)
         except anthropic.RateLimitError:
             log.warning("analyst rate limited for %s; skipping this batch", symbol)
+            self._log_call({**call, "model": model, "error": "rate_limited"})
             return None
         except anthropic.APIConnectionError:
             log.warning("analyst connection error for %s; skipping this batch", symbol)
+            self._log_call({**call, "model": model, "error": "connection_error"})
             return None
         except anthropic.APIStatusError as e:
             log.error("analyst API error for %s: %s %s", symbol, e.status_code, e.message)
+            self._log_call({**call, "model": model, "error": f"{e.status_code} {e.message}"})
             return None
 
-        if response.stop_reason != "end_turn":
-            log.warning("analyst stopped with %s for %s", response.stop_reason, symbol)
-            return None
         text = next((b.text for b in response.content if b.type == "text"), None)
-        if text is None:
+        if response.stop_reason != "end_turn" or text is None:
+            log.warning("analyst stopped with %s for %s", response.stop_reason, symbol)
+            self._log_call(call, response)
             return None
-        signal = self.to_signal(symbol, json.loads(text), now, items)
-        return replace(signal, model=model)
+        signal = replace(self.to_signal(symbol, json.loads(text), now, items), model=model)
+        self._log_call(call, response, signal.id)
+        return signal
+
+    async def _timed(self, call: dict, model: str, prompt: str):
+        start = time.monotonic()
+        call["model"] = model
+        response = await self._request(model, prompt)
+        call["latency_s"] = round(time.monotonic() - start, 3)
+        return response
+
+    def _log_call(self, call: dict, response=None, signal_id: str | None = None) -> None:
+        if not self.call_log:
+            return
+        record = dict(call, signal_id=signal_id)
+        if response is not None:
+            usage = getattr(response, "usage", None)
+            record |= {
+                "response": next((b.text for b in response.content if b.type == "text"), None),
+                "stop_reason": response.stop_reason,
+                "input_tokens": getattr(usage, "input_tokens", None),
+                "output_tokens": getattr(usage, "output_tokens", None),
+            }
+        try:
+            self.call_log(**record)
+        except Exception:
+            log.exception("failed to journal LLM call")
 
     async def _request(self, model: str, prompt: str):
         params = {

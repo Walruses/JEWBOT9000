@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from ..models import Signal
@@ -94,3 +95,16 @@ class SignalFusion:
 
     def target_position(self, symbol: str, max_qty: int | None = None) -> int:
         return self.target_for(self.conviction(symbol), max_qty)
+
+
+def apply_env_overrides(fusion: SignalFusion) -> None:
+    """Tuned parameters (FUSION_WEIGHT_*, ENTRY_THRESHOLD) from the environment."""
+    for key, source in (
+        ("FUSION_WEIGHT_LLM", "llm"),
+        ("FUSION_WEIGHT_IMBALANCE", "micro:imbalance"),
+        ("FUSION_WEIGHT_REVERSION", "micro:reversion"),
+    ):
+        if key in os.environ:
+            fusion.weights[source] = float(os.environ[key])
+    if "ENTRY_THRESHOLD" in os.environ:
+        fusion.entry_threshold = float(os.environ["ENTRY_THRESHOLD"])

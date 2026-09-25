@@ -46,6 +46,7 @@ from .pipeline import Analyst, NewsPipeline
 from .risk import RiskManager
 from .session import TradingSession
 from .signals import SignalFusion, SignalHub
+from .signals.fusion import apply_env_overrides
 from .strategy import FusedSignalStrategy
 
 log = logging.getLogger(__name__)
@@ -178,6 +179,8 @@ async def run_backtest(
     fusion = SignalFusion(hub, max_position=limits.max_position)
     if fusion_weights:
         fusion.weights = fusion_weights
+    else:
+        apply_env_overrides(fusion)
     risk = RiskManager(limits, clock=clock)
     broker = SimBroker(commission_per_share=commission_per_share, min_commission=min_commission)
     costs = CostModel(per_share=commission_per_share, minimum=min_commission)
@@ -185,6 +188,26 @@ async def run_backtest(
     universe = universe_from_env(account) if account else None
     # Decisions are stamped in simulated time, so the journal reads like a live one.
     journal = Journal(journal_path, clock=clock) if journal_path else None
+    if journal:
+        from .review import code_version
+
+        journal.start_run(
+            "backtest",
+            symbols,
+            {
+                "limits": asdict(limits),
+                "account": asdict(account_config) if account_config else None,
+                "analyst": getattr(analyst, "model", None),
+                "edge_bps": edge_bps,
+                "cost_safety_multiple": cost_safety_multiple,
+                "commission_per_share": commission_per_share,
+                "min_commission": min_commission,
+            },
+            code_version(),
+        )
+        inner = getattr(analyst, "inner", None)
+        if inner is not None and hasattr(inner, "call_log"):
+            inner.call_log = journal.record_llm_call
     engine = Engine(
         broker,
         FusedSignalStrategy(
@@ -314,6 +337,9 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s %(name)s: %(message)s")
 
+    from .tuning import apply_to_environment
+
+    apply_to_environment()
     events = read_events(args.files)
     symbols = args.symbols or sorted({e.symbol for e in events if isinstance(e, Tick)})
     analyst = None

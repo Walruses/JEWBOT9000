@@ -145,6 +145,15 @@ class FusedSignalStrategy(Strategy):
                 "blocked": why or None,
             }
             if gain < self.safety * cost or not allowed:
+                if not allowed:
+                    self._skip(tick.symbol, "tier_rules", why)
+                else:
+                    self._skip(
+                        tick.symbol,
+                        "cost_check",
+                        f"expected gain ${gain:.2f} < {self.safety:g}x round-trip cost "
+                        f"${cost:.2f} for {adding} shares",
+                    )
                 if same_side:
                     return []
                 target = 0  # flip not worth it: just close

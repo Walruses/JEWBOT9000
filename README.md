@@ -48,6 +48,7 @@ and trades through Interactive Brokers. Every order passes pre-trade risk checks
 | `session.py`, `state.py` | Trading hours / end-of-day flattening; daily PnL and halt persisted across restarts |
 | `events.py`, `backtest.py`, `download.py` | Recording format, replay backtester, IBKR history downloader |
 | `journal.py`, `report.py` | Trade journal (SQLite) and per-source performance report / weight updates |
+| `review.py`, `tuning.py` | Daily review bundle, reviewer model, bounded parameter tuning |
 | `risk.py` | Pre-trade checks, position and PnL tracking, kill switch |
 | `engine.py` | Order lifecycle: one working order per symbol, stale-order cancels, halt handling |
 | `broker/` | `IBKRBroker` (ib_async) and `SimBroker` (offline, fills conservatively) |
@@ -271,6 +272,57 @@ with a good one looks good too. Review the report before writing.
 
 Backtests can journal too (`--journal data/backtest.db`), which gives you source
 scorecards over historical data.
+
+## Daily review and the training period
+
+The plan: paper-trade first, have a more capable model review every day after the close,
+tune parameters from its proposals, and only then use real money. Everything the review
+needs is recorded automatically in `data/journal.db`:
+
+| Recorded | Where |
+|---|---|
+| Configuration of every run (all limits, tiers, weights, models, tuned values; secrets redacted) and the code version | `runs` |
+| Every order decision with the full signal breakdown, conviction, target, tier, stop and cost estimate | `decisions` |
+| Fills, round-trip trades (with exit reason, tier and stop), attribution to sources | `fills`, `trades`, `trade_decisions`, `trade_attribution` |
+| **Trades not taken** and why: cost check, tier rules, spread, day-trade limit, stop cooldown, risk checks (repeats within a minute are counted, not duplicated) | `skipped` |
+| Every analyst signal, the full text of every news item it read, which items drove it, and the price move 1/5/30/60 minutes later | `signals`, `signal_inputs`, `signal_outcomes` |
+| Every Claude API call: full prompt, response, model, tokens, latency, errors | `llm_calls` |
+| 1-minute price bars per stock (mid OHLC, average spread and book sizes) | `bars` |
+| Stops, halts, position mismatches, end-of-day flatten, account snapshots every 5 min, and every warning or error logged | `events` |
+
+**After each close** (16:10 ET, paper/live) the agent writes `data/reviews/<date>/`:
+- `bundle.json`: the whole day, self-contained, with the cumulative scorecards and the list
+  of tunable parameters with their allowed ranges.
+- `summary.md`: a readable version.
+
+```bash
+python -m trading_agent.review bundle  --date 2026-09-24   # rebuild a day's bundle
+python -m trading_agent.review analyze --date 2026-09-24   # have the reviewer model assess it
+python -m trading_agent.review apply --date 2026-09-24 --keys STOP_VOL_MULTIPLE
+python -m trading_agent.review apply --set PENNY_MIN_SCORE=0.85   # or set values by hand
+```
+
+**The reviewer:**
+- **Model:** `analyze` sends the bundle to `REVIEW_MODEL` (default `claude-fable-5-1`, the
+  most capable model), roughly $1–5 a day depending on activity. Your organization needs
+  30-day data retention for that model; otherwise set `REVIEW_MODEL=claude-opus-5-5`.
+- **What it returns:** an assessment, anomalies, a verdict on each source, proposed
+  parameter changes with rationale, evidence and confidence, strategy suggestions, and data
+  gaps. It's saved as `review.json` and `review.md`.
+- **Running it automatically:** set `REVIEW_AUTO_ANALYZE=yes` to analyse after every close.
+
+**Guardrails on tuning:**
+- **Proposals are never applied automatically.** `apply` validates each change against the
+  bounds in `tuning.py` and writes approved values to `data/tuned_params.json`.
+- **Every approval is logged** in `data/tuning_history.jsonl`.
+- **The agent loads tuned values on its next start;** they override `.env` for those keys.
+- **Hard bounds:** only listed parameters can be tuned, within fixed ranges. Risk per trade
+  can never exceed 1%, and penny confidence can't go below 0.7.
+- **Off limits:** account type, live-trading switches, the daily loss limit and gross
+  exposure can't be changed by the reviewer at all.
+
+Backtests can journal too (`--journal data/backtest.db`), so the same review works on
+historical days: `review bundle --db data/backtest.db --date ...`.
 
 ## Backtesting
 

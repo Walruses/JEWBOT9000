@@ -80,12 +80,23 @@ class Report:
     edge_moves: list[tuple[float, float]] = field(default_factory=list)
 
 
-def _since_clause(since: float | None, column: str) -> tuple[str, tuple]:
-    return (f" WHERE {column} >= ?", (since,)) if since else ("", ())
+def _since_clause(
+    since: float | None, column: str, until: float | None = None
+) -> tuple[str, tuple]:
+    conds, args = [], []
+    if since:
+        conds.append(f"{column} >= ?")
+        args.append(since)
+    if until:
+        conds.append(f"{column} < ?")
+        args.append(until)
+    return (" WHERE " + " AND ".join(conds), tuple(args)) if conds else ("", ())
 
 
-def build_report(db: sqlite3.Connection, since: float | None = None) -> Report:
-    where, args = _since_clause(since, "closed_at")
+def build_report(
+    db: sqlite3.Connection, since: float | None = None, until: float | None = None
+) -> Report:
+    where, args = _since_clause(since, "closed_at", until)
     row = db.execute(
         "SELECT COUNT(*), COALESCE(SUM(net_pnl > 0), 0), COALESCE(SUM(net_pnl), 0),"
         " COALESCE(SUM(fees), 0),"
@@ -127,7 +138,7 @@ def build_report(db: sqlite3.Connection, since: float | None = None) -> Report:
         s.pnl += pnl
 
     # News sources: which sources drove each LLM signal.
-    swhere, sargs = _since_clause(since, "ts")
+    swhere, sargs = _since_clause(since, "ts", until)
     rows = db.execute(f"SELECT id, score, confidence, model FROM signals{swhere}", sargs)
     signals: dict[str, float] = {}
     meta: dict[str, tuple[float, str]] = {}
