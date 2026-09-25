@@ -111,13 +111,24 @@ restart. Recommended VPS: 2 vCPU, 4 GB RAM, US-East region.
 
 ### Option A: Docker (simplest)
 
+On **Debian 13**, `deploy/debian13-setup.sh` does the server preparation. It installs:
+- Docker and the compose plugin, from Docker's repository
+- clock synchronisation
+- an SSH-only firewall
+- `.env`/`gateway.env` created from the examples with private permissions
+- a `data/` directory writable by the container's user (uid 1000)
+
 ```bash
-git clone <repo> /opt/JEWBOT9000 && cd /opt/JEWBOT9000
-cp .env.example .env && cp gateway.env.example gateway.env    # fill both in
-chmod 600 .env gateway.env
-CODE_VERSION=$(git rev-parse --short HEAD) docker compose up -d --build
-docker compose logs -f agent
+sudo apt-get install -y git
+sudo git clone <repo> /opt/JEWBOT9000 && cd /opt/JEWBOT9000
+sudo git checkout <branch> && sudo deploy/debian13-setup.sh
+sudo nano .env && sudo nano gateway.env                        # fill both in
+sudo CODE_VERSION=$(git rev-parse --short HEAD) docker compose up -d --build
+sudo docker compose logs -f agent
 ```
+
+On other distributions: install Docker, copy the two `.example` files, `chmod 600` them,
+and `chown 1000:1000 data` before `docker compose up`.
 
 - **Gateway:** the `ib-gateway` service uses the community image `ghcr.io/gnzsnz/ib-gateway`
   (IB Gateway, IBC and Xvfb), logged in to the paper account from `gateway.env`.
@@ -132,7 +143,9 @@ docker compose logs -f agent
 ### Option B: systemd
 
 1. **Get the code:** create a `trader` user, clone to `/opt/JEWBOT9000`,
-   `python3 -m venv .venv && .venv/bin/pip install -e .`, and fill in `.env`.
+   `python3 -m venv .venv && .venv/bin/pip install -e .`, and fill in `.env`. On Debian 13,
+   first run `apt install python3-venv git xvfb unzip`. Its Python 3.13 works, but the
+   system Python refuses global `pip install`, so the venv is required.
 2. **Set up IB Gateway:**
    - Install IB Gateway (stable) and IBC (github.com/IbcAlpha/IBC) and `apt install xvfb`.
    - Create `~/ibc/config.ini` as described at the top of
