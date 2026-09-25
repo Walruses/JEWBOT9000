@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..models import Signal
 from .hub import SignalHub
 
 DEFAULT_WEIGHTS = {"llm": 0.6, "micro:imbalance": 0.25, "micro:reversion": 0.15}
@@ -62,6 +63,16 @@ class SignalFusion:
         if (total > 0) != (primary > 0):
             return 0.0
         return max(-1.0, min(1.0, total))
+
+    def strongest_opener(self, symbol: str) -> tuple[Signal, float] | None:
+        """The active opener (LLM) signal with the most weight right now, and its decay."""
+        best = None
+        for sig, decay in self.hub.active(symbol):
+            if self.is_opener(sig.source) and sig.score:
+                strength = abs(sig.score) * sig.confidence * decay
+                if best is None or strength > best[0]:
+                    best = (strength, sig, decay)
+        return (best[1], best[2]) if best else None
 
     def breakdown(self, symbol: str) -> list[dict]:
         """Each active signal's contribution to conviction, for the trade journal."""

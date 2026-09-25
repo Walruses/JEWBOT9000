@@ -83,7 +83,17 @@ class RiskManager:
         self.halted = True
         self.halt_reason = reason
 
-    def check(self, intent: OrderIntent, mid: float) -> tuple[bool, str]:
+    def check(
+        self,
+        intent: OrderIntent,
+        mid: float,
+        bid: float | None = None,
+        ask: float | None = None,
+    ) -> tuple[bool, str]:
+        """Pre-trade checks. With the current bid/ask, the fat-finger check measures the
+        limit price against the quote rather than the mid: an exit at the bid (or ask) of
+        a wide-spread stock is legitimate, and must never be refused for being "far from
+        mid"."""
         lim = self.limits
         if self.halted and not (self.allow_flatten and self._reduces(intent)):
             return False, f"halted: {self.halt_reason}"
@@ -95,9 +105,17 @@ class RiskManager:
             return False, "invalid price"
         if intent.qty * intent.limit_price > lim.max_order_notional:
             return False, "order notional exceeds limit"
-        deviation_bps = abs(intent.limit_price - mid) / mid * 10_000
-        if deviation_bps > lim.max_price_deviation_bps:
-            return False, f"limit price {deviation_bps:.1f}bps from mid"
+        band = lim.max_price_deviation_bps / 10_000
+        if bid and ask and 0 < bid <= ask:
+            if not bid * (1 - band) <= intent.limit_price <= ask * (1 + band):
+                return False, (
+                    f"limit price {intent.limit_price} outside quote {bid}/{ask} "
+                    f"+/-{lim.max_price_deviation_bps:.0f}bps"
+                )
+        else:
+            deviation_bps = abs(intent.limit_price - mid) / mid * 10_000
+            if deviation_bps > lim.max_price_deviation_bps:
+                return False, f"limit price {deviation_bps:.1f}bps from mid"
 
         p = self._pos(intent.symbol)
         if intent.side is Side.BUY:

@@ -21,6 +21,7 @@ from collections.abc import Callable
 from ..costs import CostModel
 from ..models import OrderIntent, Side, Tick
 from ..signals import MicrostructureSignals, SignalFusion, SignalHub
+from ..universe import Universe
 from .base import Strategy
 
 
@@ -36,6 +37,7 @@ class FusedSignalStrategy(Strategy):
         cost_safety_multiple: float = 2.0,
         min_rebalance_fraction: float = 0.2,
         sizer: Callable[[float], int] | None = None,
+        universe: Universe | None = None,
     ):
         super().__init__(symbols)
         self.hub = hub
@@ -50,11 +52,18 @@ class FusedSignalStrategy(Strategy):
         # price -> largest position in shares (the account's risk-per-trade sizing);
         # without one, fusion.max_position shares.
         self.sizer = sizer
+        # Per-tier rules (penny stocks etc.) and volatility-scaled sizing; overrides sizer.
+        self.universe = universe
         self._max_qty: dict[str, int] = {}
         self._last_eval: dict[str, dict] = {}
 
     def max_qty(self, symbol: str, price: float) -> int:
-        qty = self.sizer(price) if self.sizer else self.fusion.max_position
+        if self.universe:
+            qty = self.universe.max_shares(symbol, price)
+        elif self.sizer:
+            qty = self.sizer(price)
+        else:
+            qty = self.fusion.max_position
         self._max_qty[symbol] = qty
         return qty
 
@@ -86,13 +95,23 @@ class FusedSignalStrategy(Strategy):
             return []
         for sig in self.micro.update(tick):
             self.hub.publish(sig)
+        tier = None
+        if self.universe:
+            self.universe.update(tick)
+            tier = self.universe.tier(tick.mid)
 
         # The LLM view alone must justify holding a position; microstructure only
         # resizes it. (Entering on a combined view but exiting on the LLM view alone
         # would churn.)
         max_qty = self.max_qty(tick.symbol, tick.mid)
         primary = self.fusion.target_for(self.fusion.primary_conviction(tick.symbol), max_qty)
-        target = self.fusion.target_position(tick.symbol, max_qty) if primary else 0
+        use_micro = tier is None or tier.use_microstructure
+        if not primary:
+            target = 0
+        elif use_micro:
+            target = self.fusion.target_position(tick.symbol, max_qty)
+        else:
+            target = primary
         same_side = position == 0 or target == 0 or (position > 0) == (target > 0)
         if position and same_side and abs(target) < abs(position):
             target = self._reduction_target(tick.symbol, position, max_qty)
@@ -105,14 +124,27 @@ class FusedSignalStrategy(Strategy):
         same_side = position == 0 or target == 0 or (position > 0) == (target > 0)
         adding = max(0, abs(target) - abs(position)) if same_side else abs(target)
         if adding:
-            conviction = self.fusion.conviction(tick.symbol)
+            conviction = (
+                self.fusion.conviction(tick.symbol)
+                if use_micro
+                else self.fusion.primary_conviction(tick.symbol)
+            )
             gain = self.expected_gain(adding, tick.mid, conviction)
             cost = self.costs.round_trip(adding, tick.mid)
+            allowed, why = True, ""
+            if self.universe:
+                opener = self.fusion.strongest_opener(tick.symbol)
+                allowed, why = self.universe.entry_allowed(tick, target < 0, opener)
             self._last_eval[tick.symbol] = {
                 "expected_gain": round(gain, 4),
                 "expected_cost": round(cost, 4),
+                "tier": tier.name if tier else None,
+                "stop_pct": round(self.universe.stop_pct(tick.symbol, tick.mid), 3)
+                if self.universe
+                else None,
+                "blocked": why or None,
             }
-            if gain < self.safety * cost:
+            if gain < self.safety * cost or not allowed:
                 if same_side:
                     return []
                 target = 0  # flip not worth it: just close

@@ -19,6 +19,9 @@ from .base import DoneCallback, FillCallback, TickCallback
 log = logging.getLogger(__name__)
 
 
+OTC_EXCHANGES = frozenset({"PINK", "OTC", "OTCBB", "OTCQB", "OTCQX", "GREY", "EXPERT"})
+
+
 def _num(x: float | None) -> float:
     return 0.0 if x is None or math.isnan(x) else float(x)
 
@@ -49,6 +52,13 @@ class IBKRBroker:
         await self.ib.qualifyContractsAsync(*contracts)
         by_con_id: dict[int, str] = {}
         for sym, contract in zip(symbols, contracts, strict=True):
+            if not contract.conId:
+                log.warning("%s: not found at IBKR; skipping", sym)
+                continue
+            if contract.primaryExchange.upper() in OTC_EXCHANGES:
+                # IBKR restricts buying many OTC stocks, and their data/news are poor.
+                log.warning("%s trades OTC (%s); skipping", sym, contract.primaryExchange)
+                continue
             self._contracts[sym] = contract
             by_con_id[contract.conId] = sym
             self.ib.reqMktData(contract, "", False, False)

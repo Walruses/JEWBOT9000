@@ -154,3 +154,36 @@ def account_config_from_env():
         max_gross_exposure_pct=float(_env("MAX_GROSS_EXPOSURE_PCT", str(d.max_gross_exposure_pct))),
         stop_cooldown_minutes=float(_env("STOP_COOLDOWN_MINUTES", str(d.stop_cooldown_minutes))),
     )
+
+
+def universe_from_env(account):
+    """Tier rules: the standard tier follows the account's risk settings; penny-tier
+    settings have their own variables."""
+    from dataclasses import replace
+
+    from .universe import PENNY, STANDARD, Universe
+
+    cfg = account.config
+    standard = replace(
+        STANDARD,
+        risk_per_trade_pct=cfg.risk_per_trade_pct,
+        max_position_pct=cfg.max_position_pct,
+        stop_default_pct=cfg.stop_loss_pct,
+        max_spread_pct=float(_env("MAX_SPREAD_PCT", str(STANDARD.max_spread_pct))),
+    )
+    penny = replace(
+        PENNY,
+        risk_per_trade_pct=float(_env("PENNY_RISK_PER_TRADE_PCT", str(PENNY.risk_per_trade_pct))),
+        max_position_pct=float(_env("PENNY_MAX_POSITION_PCT", str(PENNY.max_position_pct))),
+        max_spread_pct=float(_env("PENNY_MAX_SPREAD_PCT", str(PENNY.max_spread_pct))),
+        min_score=float(_env("PENNY_MIN_SCORE", str(PENNY.min_score))),
+        min_confidence=float(_env("PENNY_MIN_CONFIDENCE", str(PENNY.min_confidence))),
+    )
+    return Universe(
+        account,
+        standard=standard,
+        penny=penny,
+        penny_below=float(_env("PENNY_BELOW", "5.0")),
+        min_price=float(_env("MIN_PRICE", "1.0")),
+        stop_vol_multiple=float(_env("STOP_VOL_MULTIPLE", "2.0")),
+    )

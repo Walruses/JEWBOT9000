@@ -64,6 +64,7 @@ class Engine:
         reconcile_interval: float = 15.0,
         journal: TradeJournal | None = None,
         account: AccountGuard | None = None,
+        stop_pct: Callable[[str, float], float] | None = None,
     ):
         self.broker = broker
         self.strategy = strategy
@@ -76,6 +77,9 @@ class Engine:
         self.account = account
         risk.account = account
         self._stop_cooldown_until: dict[str, float] = {}
+        # (symbol, price) -> stop distance in %, fixed per position when it opens.
+        self.stop_pct = stop_pct
+        self._entry_stop: dict[str, float] = {}
         self._equity_at_open = account.config.starting_equity if account else 0.0
         self.reconcile_interval = reconcile_interval
         self._clock = clock
@@ -214,7 +218,7 @@ class Engine:
             self._flatten(tick)
             return
         for intent in self.strategy.on_tick(tick, self.risk.position(tick.symbol)):
-            self._submit(intent, tick.mid, "strategy")
+            self._submit(intent, tick, "strategy")
 
     def _check_stop(self, tick: Tick) -> bool:
         """Close a position whose price has moved STOP_LOSS_PCT against its average entry.
@@ -225,7 +229,7 @@ class Engine:
         if qty == 0:
             return False
         avg = self.risk.avg_price(tick.symbol)
-        stop_frac = self.account.config.stop_loss_pct / 100
+        stop_frac = self._entry_stop.get(tick.symbol, self.account.config.stop_loss_pct) / 100
         hit = tick.mid <= avg * (1 - stop_frac) if qty > 0 else tick.mid >= avg * (1 + stop_frac)
         if not hit:
             return False
@@ -253,7 +257,7 @@ class Engine:
         log.info("flattening %s: %s %d", tick.symbol, intent.side.value, intent.qty)
         if reason is None:
             reason = "halt_flatten" if self.risk.halted else "eod_flatten"
-        self._submit(intent, tick.mid, reason)
+        self._submit(intent, tick, reason)
 
     # ---- orders ----------------------------------------------------------------------
 
@@ -283,8 +287,9 @@ class Engine:
             return self.account.can_buy(intent.qty * intent.limit_price + pending_buys)
         return True, ""
 
-    def _submit(self, intent: OrderIntent, mid: float, reason: str) -> None:
-        ok, why = self.risk.check(intent, mid)
+    def _submit(self, intent: OrderIntent, tick: Tick, reason: str) -> None:
+        mid = tick.mid
+        ok, why = self.risk.check(intent, mid, tick.bid, tick.ask)
         opening = self._opens(intent)
         if ok and reason == "strategy":
             ok, why = self._account_check(intent, opening)
@@ -326,7 +331,11 @@ class Engine:
             return
         before = self.risk.position(fill.symbol)
         after = before + fill.side.sign * fill.qty
+        if after == 0:
+            self._entry_stop.pop(fill.symbol, None)
         if after != 0 and (before == 0 or (before > 0) != (after > 0)):
+            if self.stop_pct:
+                self._entry_stop[fill.symbol] = self.stop_pct(fill.symbol, fill.price)
             self.account.record_open(self._day)
             remaining = self.account.day_trades_remaining(self._day)
             if remaining is not None:

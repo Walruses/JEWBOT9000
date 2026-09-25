@@ -118,6 +118,50 @@ briefings, go to Opus 5. If Sonnet declines to answer, the batch is retried on O
 journal records which model produced each signal. The report's "ANALYST MODELS" table
 compares their hit rates, so you can check the cheaper model holds up.
 
+### What gets traded: watchlists and tiers
+
+Choose symbols with `--symbols`, a watchlist file (`--symbols-file`, one per line), or IBKR
+scanners (`--scan smallcap penny`, or `python -m trading_agent.scan --preset ...` to save
+`data/watchlist.txt`). At most `--max-symbols` (30) are traded. Scanner presets look for
+unusually heavy volume, which is where news tends to be, among exchange-listed US
+operating companies:
+
+| Preset | Filter |
+|---|---|
+| `largecap` | market cap > $10B, price > $5 |
+| `smallcap` | market cap $300M–$2B, price > $5, 500k+ shares/day |
+| `penny` | price $1–$5, 1M+ shares/day |
+
+OTC and pink-sheet stocks are always skipped, even if listed by hand: IBKR restricts
+buying many of them, and their data and news are poor.
+
+Each stock is handled by its price tier:
+
+| | Standard ($5+, including small caps) | Penny ($1–$5) |
+|---|---|---|
+| Opens a position when | the Claude view clears the entry threshold | Claude is **very confident**: sentiment and confidence both >= 0.8 on a fresh view (`PENNY_MIN_SCORE`, `PENNY_MIN_CONFIDENCE`) |
+| Risk per trade | `RISK_PER_TRADE_PCT` (1%) | `PENNY_RISK_PER_TRADE_PCT` (0.5%) |
+| Max position | `MAX_POSITION_PCT` (50%) | `PENNY_MAX_POSITION_PCT` (10%) |
+| Max spread to enter | `MAX_SPREAD_PCT` (0.5%) | `PENNY_MAX_SPREAD_PCT` (2%) |
+| Stop | 1–5%, from volatility | 3–15%, from volatility |
+| Short selling | yes | no |
+| Order-book signals | adjust size and timing | ignored (thin books are easy to spoof) |
+
+Below `MIN_PRICE` ($1) nothing new is opened.
+
+**Stops follow each stock's volatility:** `STOP_VOL_MULTIPLE` (2) x the standard deviation
+of 1-minute returns over 30 minutes, within the tier's range. The tier default (2% / 8%)
+applies until 15 minutes of history exist. Each position's stop is fixed when it opens,
+and the position is sized from it: a wider stop means fewer shares, same dollar risk.
+
+For small companies, EDGAR also tracks offering filings (S-1, S-3, 424B prospectuses),
+which usually mean dilution. Claude is told to be especially skeptical of promotional
+releases and social-media hype for these stocks.
+
+The fat-finger check measures limit prices against the current **bid/ask**, not the mid.
+So stop-loss, end-of-day and halt exits at the touch are never refused on wide-spread
+stocks, while a genuinely mispriced order still is.
+
 ### Account rules and position sizing
 
 Positions are sized by **risk per trade**, not by share count:

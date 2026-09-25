@@ -13,6 +13,7 @@ import contextlib
 import logging
 import signal
 import sys
+from pathlib import Path
 
 from .account import AccountGuard
 from .config import (
@@ -24,6 +25,7 @@ from .config import (
     live_trading_allowed,
     risk_limits_from_env,
     runtime_config_from_env,
+    universe_from_env,
 )
 from .costs import CostModel
 from .engine import Engine
@@ -108,8 +110,6 @@ async def run(args: argparse.Namespace) -> None:
     journal = Journal(rt.journal_file if args.mode != "sim" else "data/journal-sim.db")
 
     # Source quality from `python -m trading_agent.report --write`, if it exists.
-    from pathlib import Path
-
     from .report import load_quality
 
     quality = load_quality(Path(rt.quality_file)) or {}
@@ -136,11 +136,23 @@ async def run(args: argparse.Namespace) -> None:
             "margin account under $25,000: pattern day trader rule allows 3 day trades per "
             "5 business days, so at most 3 new positions per rolling week"
         )
+    universe = universe_from_env(account)
+    log.info(
+        "tiers: standard >= $%.2f (spread <= %.1f%%); penny $%.2f-$%.2f only on "
+        "sentiment/confidence >= %.1f/%.1f, %.1f%% risk, long only",
+        universe.penny_below,
+        universe.standard.max_spread_pct,
+        universe.min_price,
+        universe.penny_below,
+        universe.penny.min_score,
+        universe.penny.min_confidence,
+        universe.penny.risk_per_trade_pct,
+    )
     strategy = FusedSignalStrategy(
         args.symbols,
         hub,
         fusion,
-        sizer=account.max_shares,
+        universe=universe,
         costs=costs,
         edge_bps_at_full_conviction=edge_bps,
         cost_safety_multiple=cost_cfg.safety_multiple,
@@ -159,6 +171,7 @@ async def run(args: argparse.Namespace) -> None:
         recorder=recorder,
         journal=journal,
         account=account,
+        stop_pct=universe.stop_pct,
     )
 
     loop = asyncio.get_running_loop()
@@ -232,6 +245,27 @@ async def _synthetic_views(hub: SignalHub, symbols: list[str]) -> None:
         await asyncio.sleep(60)
 
 
+def resolve_symbols(args: argparse.Namespace) -> list[str]:
+    """--symbols, plus --symbols-file, plus --scan results; AAPL if nothing is given."""
+    symbols = [s.upper() for s in args.symbols]
+    if args.symbols_file:
+        from .scan import read_watchlist
+
+        symbols += read_watchlist(args.symbols_file)
+    if args.scan:
+        if args.mode == "sim":
+            sys.exit("--scan needs IBKR (paper or live mode)")
+        from .scan import build_watchlist
+
+        symbols += asyncio.run(build_watchlist(args.scan, rows=20, max_symbols=args.max_symbols))
+    symbols = list(dict.fromkeys(symbols)) or ["AAPL"]
+    if len(symbols) > args.max_symbols:
+        log.warning("trading the first %d of %d symbols", args.max_symbols, len(symbols))
+        symbols = symbols[: args.max_symbols]
+    log.info("symbols (%d): %s", len(symbols), " ".join(symbols))
+    return symbols
+
+
 def _clear_halt(store: StateStore) -> None:
     from datetime import date
 
@@ -245,7 +279,15 @@ def _clear_halt(store: StateStore) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="trading-agent")
     parser.add_argument("--mode", choices=["sim", "paper", "live"], default="sim")
-    parser.add_argument("--symbols", nargs="+", default=["AAPL"])
+    parser.add_argument("--symbols", nargs="+", default=[])
+    parser.add_argument("--symbols-file", type=Path, help="watchlist, one symbol per line")
+    parser.add_argument(
+        "--scan",
+        nargs="+",
+        metavar="PRESET",
+        help="add symbols from IBKR scanners at startup (largecap, smallcap, penny)",
+    )
+    parser.add_argument("--max-symbols", type=int, default=30)
     parser.add_argument("--no-news", action="store_true", help="disable the LLM news pipeline")
     parser.add_argument(
         "--record", action="store_true", help="record ticks, news and signals for backtesting"
@@ -258,6 +300,7 @@ def main() -> None:
     logging.basicConfig(
         level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    args.symbols = resolve_symbols(args)
     asyncio.run(run(args))
 
 

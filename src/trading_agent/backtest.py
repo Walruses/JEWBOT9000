@@ -31,7 +31,12 @@ from pathlib import Path
 
 from .account import AccountConfig, AccountGuard
 from .broker.sim import SimBroker
-from .config import RiskLimits, account_config_from_env, risk_limits_from_env
+from .config import (
+    RiskLimits,
+    account_config_from_env,
+    risk_limits_from_env,
+    universe_from_env,
+)
 from .costs import CostModel
 from .engine import Engine
 from .events import Event, event_ts, read_events
@@ -177,6 +182,7 @@ async def run_backtest(
     broker = SimBroker(commission_per_share=commission_per_share, min_commission=min_commission)
     costs = CostModel(per_share=commission_per_share, minimum=min_commission)
     account = AccountGuard(account_config) if account_config else None
+    universe = universe_from_env(account) if account else None
     # Decisions are stamped in simulated time, so the journal reads like a live one.
     journal = Journal(journal_path, clock=clock) if journal_path else None
     engine = Engine(
@@ -188,7 +194,7 @@ async def run_backtest(
             costs=costs,
             edge_bps_at_full_conviction=edge_bps,
             cost_safety_multiple=cost_safety_multiple,
-            sizer=account.max_shares if account else None,
+            universe=universe,
         ),
         risk,
         order_ttl=order_ttl,
@@ -196,6 +202,7 @@ async def run_backtest(
         session=session,
         journal=journal,
         account=account,
+        stop_pct=universe.stop_pct if universe else None,
     )
     if account:
         await engine.startup()

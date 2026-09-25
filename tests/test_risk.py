@@ -99,3 +99,13 @@ def test_restore_reapplies_loss_limit():
     risk, _ = make(max_daily_loss=50)
     risk.restore(-60.0, halted=False, halt_reason="")
     assert risk.halted
+
+
+def test_exits_at_the_touch_pass_even_with_wide_spreads():
+    risk, _ = make(max_price_deviation_bps=50)
+    risk.on_fill(fill(Side.BUY, 10, 2.00))
+    # 2.00 x 2.10 quote: mid 2.05, the bid is 244bps below it.
+    assert not risk.check(sell(10, px=2.00), 2.05)[0]  # mid-only check: refused
+    assert risk.check(sell(10, px=2.00), 2.05, bid=2.00, ask=2.10)[0]  # quote-aware: ok
+    ok, why = risk.check(sell(10, px=1.50), 2.05, bid=2.00, ask=2.10)
+    assert not ok and "outside quote" in why  # a real fat finger is still caught

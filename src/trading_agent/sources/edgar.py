@@ -33,7 +33,18 @@ TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 FILING_DIR = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}"
 
-DEFAULT_FORMS = frozenset({"8-K", "8-K/A", "4", "10-Q", "10-K", "SC 13D", "SC 13G", "6-K"})
+# Offerings and shelf registrations: for small companies, usually new shares (dilution).
+DILUTION_FORMS = {
+    "S-1": "registration of new securities (often a share offering)",
+    "S-1/A": "amended registration of new securities",
+    "S-3": "shelf registration: lets the company sell shares over time",
+    "424B3": "prospectus: securities being offered or resold",
+    "424B4": "final prospectus for an offering (pricing set)",
+    "424B5": "prospectus supplement: typically a share sale off a shelf (dilution)",
+}
+DEFAULT_FORMS = frozenset(
+    {"8-K", "8-K/A", "4", "10-Q", "10-K", "SC 13D", "SC 13G", "6-K", *DILUTION_FORMS}
+)
 TEXT_FORMS = frozenset({"8-K", "8-K/A", "6-K"})
 MAX_FILING_CHARS = 20_000
 _EXHIBIT_99 = re.compile(r"ex[-_]?99", re.IGNORECASE)
@@ -126,6 +137,8 @@ class EdgarSource:
             desc = col("primaryDocDescription", i)
             codes = [c.strip() for c in col("items", i).split(",") if c.strip()]
             summary = "; ".join(f"Item {c}: {EIGHT_K_ITEMS.get(c, 'see filing')}" for c in codes)
+            if form in DILUTION_FORMS:
+                summary = f"Form {form}: {DILUTION_FORMS[form]}"
             directory = FILING_DIR.format(cik=cik, acc=acc.replace("-", ""))
             primary = col("primaryDocument", i)
             item = NewsItem(
