@@ -1,0 +1,140 @@
+"""Pre-trade risk checks, position/PnL tracking and the kill switch.
+
+Every order passes through RiskManager.check() before reaching the broker. Worst-case
+exposure counts working orders as if they will fully fill, so a burst of orders cannot
+stack past the position limit.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from .config import RiskLimits
+from .models import Fill, OrderIntent, Side
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class Position:
+    qty: int = 0
+    avg_price: float = 0.0
+    pending_buy: int = 0
+    pending_sell: int = 0
+
+
+class RiskManager:
+    def __init__(self, limits: RiskLimits, clock: Callable[[], float] = time.monotonic):
+        self.limits = limits
+        self._clock = clock
+        self._positions: dict[str, Position] = {}
+        self._marks: dict[str, float] = {}
+        self._order_times: deque[float] = deque()
+        self.realized_pnl = 0.0
+        self.halted = False
+        self.halt_reason = ""
+
+    def _pos(self, symbol: str) -> Position:
+        return self._positions.setdefault(symbol, Position())
+
+    def position(self, symbol: str) -> int:
+        return self._pos(symbol).qty
+
+    def halt(self, reason: str) -> None:
+        if not self.halted:
+            log.critical("TRADING HALTED: %s", reason)
+        self.halted = True
+        self.halt_reason = reason
+
+    def check(self, intent: OrderIntent, mid: float) -> tuple[bool, str]:
+        lim = self.limits
+        if self.halted:
+            return False, f"halted: {self.halt_reason}"
+        if intent.qty <= 0:
+            return False, "non-positive quantity"
+        if intent.qty > lim.max_order_qty:
+            return False, f"qty {intent.qty} > max_order_qty {lim.max_order_qty}"
+        if intent.limit_price <= 0 or mid <= 0:
+            return False, "invalid price"
+        if intent.qty * intent.limit_price > lim.max_order_notional:
+            return False, "order notional exceeds limit"
+        deviation_bps = abs(intent.limit_price - mid) / mid * 10_000
+        if deviation_bps > lim.max_price_deviation_bps:
+            return False, f"limit price {deviation_bps:.1f}bps from mid"
+
+        p = self._pos(intent.symbol)
+        if intent.side is Side.BUY:
+            worst = p.qty + p.pending_buy + intent.qty
+        else:
+            worst = p.qty - p.pending_sell - intent.qty
+        if abs(worst) > lim.max_position:
+            return False, f"worst-case position {worst} exceeds {lim.max_position}"
+
+        now = self._clock()
+        while self._order_times and now - self._order_times[0] >= 1.0:
+            self._order_times.popleft()
+        if len(self._order_times) >= lim.max_orders_per_sec:
+            return False, "order rate limit"
+        return True, ""
+
+    def on_submit(self, intent: OrderIntent) -> None:
+        self._order_times.append(self._clock())
+        p = self._pos(intent.symbol)
+        if intent.side is Side.BUY:
+            p.pending_buy += intent.qty
+        else:
+            p.pending_sell += intent.qty
+
+    def on_order_closed(self, symbol: str, side: Side, unfilled_qty: int) -> None:
+        """Release exposure reserved for the unfilled remainder of a cancelled/done order."""
+        self._release_pending(self._pos(symbol), side, unfilled_qty)
+
+    def on_fill(self, fill: Fill) -> None:
+        p = self._pos(fill.symbol)
+        self._release_pending(p, fill.side, fill.qty)
+
+        signed = fill.side.sign * fill.qty
+        if p.qty == 0 or (p.qty > 0) == (signed > 0):
+            total = abs(p.qty) + fill.qty
+            p.avg_price = (p.avg_price * abs(p.qty) + fill.price * fill.qty) / total
+            p.qty += signed
+        else:
+            closing = min(abs(p.qty), fill.qty)
+            direction = 1 if p.qty > 0 else -1
+            self.realized_pnl += closing * (fill.price - p.avg_price) * direction
+            p.qty += signed
+            if p.qty == 0:
+                p.avg_price = 0.0
+            elif fill.qty > closing:  # flipped through flat
+                p.avg_price = fill.price
+        self._check_loss()
+
+    def update_mark(self, symbol: str, mid: float) -> None:
+        self._marks[symbol] = mid
+        self._check_loss()
+
+    def unrealized_pnl(self) -> float:
+        total = 0.0
+        for sym, p in self._positions.items():
+            mark = self._marks.get(sym)
+            if p.qty and mark is not None:
+                total += p.qty * (mark - p.avg_price)
+        return total
+
+    def total_pnl(self) -> float:
+        return self.realized_pnl + self.unrealized_pnl()
+
+    def _check_loss(self) -> None:
+        if self.total_pnl() <= -self.limits.max_daily_loss:
+            self.halt(f"daily loss limit hit (pnl={self.total_pnl():.2f})")
+
+    @staticmethod
+    def _release_pending(p: Position, side: Side, qty: int) -> None:
+        if side is Side.BUY:
+            p.pending_buy = max(0, p.pending_buy - qty)
+        else:
+            p.pending_sell = max(0, p.pending_sell - qty)
