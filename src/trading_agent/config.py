@@ -22,8 +22,9 @@ class IBConfig:
 
 @dataclass(frozen=True)
 class RiskLimits:
-    max_position: int = 100
-    max_order_qty: int = 100
+    # Share-count backstops; real sizing comes from the account's risk-per-trade rules.
+    max_position: int = 5_000
+    max_order_qty: int = 5_000
     max_order_notional: float = 25_000.0
     max_daily_loss: float = 500.0
     # IBKR rejects/disconnects clients above ~50 messages/sec; stay well below it.
@@ -134,4 +135,22 @@ def cost_config_from_env() -> CostConfig:
         extra_fees_per_share=float(_env("EXTRA_FEES_PER_SHARE", str(d.extra_fees_per_share))),
         edge_bps=float(_env("EDGE_BPS_FULL_CONVICTION", str(d.edge_bps))),
         safety_multiple=float(_env("COST_SAFETY_MULTIPLE", str(d.safety_multiple))),
+    )
+
+
+def account_config_from_env():
+    from .account import AccountConfig
+
+    d = AccountConfig()
+    account_type = _env("ACCOUNT_TYPE", d.account_type).strip().lower()
+    if account_type not in ("cash", "margin"):
+        raise ValueError(f"ACCOUNT_TYPE must be cash or margin, not {account_type!r}")
+    return AccountConfig(
+        account_type=account_type,
+        starting_equity=float(_env("ACCOUNT_EQUITY", str(d.starting_equity))),
+        risk_per_trade_pct=float(_env("RISK_PER_TRADE_PCT", str(d.risk_per_trade_pct))),
+        stop_loss_pct=float(_env("STOP_LOSS_PCT", str(d.stop_loss_pct))),
+        max_position_pct=float(_env("MAX_POSITION_PCT", str(d.max_position_pct))),
+        max_gross_exposure_pct=float(_env("MAX_GROSS_EXPOSURE_PCT", str(d.max_gross_exposure_pct))),
+        stop_cooldown_minutes=float(_env("STOP_COOLDOWN_MINUTES", str(d.stop_cooldown_minutes))),
     )

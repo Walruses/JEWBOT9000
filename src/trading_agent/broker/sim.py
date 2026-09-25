@@ -57,6 +57,9 @@ class SimBroker:
     async def positions(self) -> dict[str, tuple[int, float]]:
         return {s: (q, self._avg.get(s, 0.0)) for s, q in self._positions.items() if q}
 
+    async def account(self) -> None:
+        return None  # the engine falls back to starting equity + PnL
+
     async def subscribe(self, symbols: list[str], on_tick: TickCallback) -> None:
         self._on_tick = on_tick
         if self._synthetic:

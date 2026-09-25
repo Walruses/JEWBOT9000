@@ -13,6 +13,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .account import AccountGuard
 from .config import RiskLimits
 from .models import Fill, OrderIntent, Side
 
@@ -37,6 +38,8 @@ class RiskManager:
         self.realized_pnl = 0.0
         self.halted = False
         self.halt_reason = ""
+        # Account-level caps (sizing, exposure, cash-account rules); optional.
+        self.account: AccountGuard | None = None
         self.allow_flatten = False
 
     def _pos(self, symbol: str) -> Position:
@@ -44,6 +47,9 @@ class RiskManager:
 
     def position(self, symbol: str) -> int:
         return self._pos(symbol).qty
+
+    def avg_price(self, symbol: str) -> float:
+        return self._pos(symbol).avg_price
 
     def positions(self) -> dict[str, int]:
         return {sym: p.qty for sym, p in self._positions.items() if p.qty}
@@ -101,12 +107,43 @@ class RiskManager:
         # Orders that shrink an oversized position (e.g. one inherited at startup) are allowed.
         if abs(worst) > lim.max_position and abs(worst) >= abs(p.qty):
             return False, f"worst-case position {worst} exceeds {lim.max_position}"
+        ok, why = self._check_account(intent, p, worst, mid)
+        if not ok:
+            return False, why
 
         now = self._clock()
         while self._order_times and now - self._order_times[0] >= 1.0:
             self._order_times.popleft()
         if len(self._order_times) >= lim.max_orders_per_sec:
             return False, "order rate limit"
+        return True, ""
+
+    def _check_account(
+        self, intent: OrderIntent, p: Position, worst: int, mid: float
+    ) -> tuple[bool, str]:
+        """Account-level caps: risk per trade, concentration, gross exposure, no shorts
+        in a cash account. Only orders that increase exposure are capped."""
+        acct = self.account
+        if acct is None:
+            return True, ""
+        if acct.config.is_cash and worst < 0:
+            return False, "cash account: short selling not allowed"
+        if abs(worst) <= abs(p.qty):
+            return True, ""
+        cap = acct.max_position_value()
+        if abs(worst) * mid > cap * 1.02:  # small tolerance for price moves since sizing
+            return False, (
+                f"position value ${abs(worst) * mid:,.0f} exceeds ${cap:,.0f} "
+                f"(risk per trade / concentration cap)"
+            )
+        gross = abs(worst) * mid
+        for sym, other in self._positions.items():
+            if sym == intent.symbol:
+                continue
+            exposure = max(abs(other.qty + other.pending_buy), abs(other.qty - other.pending_sell))
+            gross += exposure * self._marks.get(sym, other.avg_price)
+        if gross > acct.max_gross_exposure * 1.001:
+            return False, f"gross exposure ${gross:,.0f} exceeds ${acct.max_gross_exposure:,.0f}"
         return True, ""
 
     def _reduces(self, intent: OrderIntent) -> bool:

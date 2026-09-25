@@ -16,6 +16,8 @@ the order book, and every step of a decaying view, would cost a commission.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from ..costs import CostModel
 from ..models import OrderIntent, Side, Tick
 from ..signals import MicrostructureSignals, SignalFusion, SignalHub
@@ -33,6 +35,7 @@ class FusedSignalStrategy(Strategy):
         edge_bps_at_full_conviction: float = 50.0,
         cost_safety_multiple: float = 2.0,
         min_rebalance_fraction: float = 0.2,
+        sizer: Callable[[float], int] | None = None,
     ):
         super().__init__(symbols)
         self.hub = hub
@@ -43,16 +46,28 @@ class FusedSignalStrategy(Strategy):
         self.safety = cost_safety_multiple
         # Ignore target changes smaller than this share of max position (anti-churn),
         # except when going flat.
-        self.min_rebalance_qty = max(1, round(min_rebalance_fraction * fusion.max_position))
+        self.min_rebalance_fraction = min_rebalance_fraction
+        # price -> largest position in shares (the account's risk-per-trade sizing);
+        # without one, fusion.max_position shares.
+        self.sizer = sizer
+        self._max_qty: dict[str, int] = {}
         self._last_eval: dict[str, dict] = {}
 
-    def _reduction_target(self, symbol: str, position: int) -> int:
-        primary = self.fusion.target_for(self.fusion.primary_conviction(symbol))
+    def max_qty(self, symbol: str, price: float) -> int:
+        qty = self.sizer(price) if self.sizer else self.fusion.max_position
+        self._max_qty[symbol] = qty
+        return qty
+
+    def min_rebalance_qty(self, max_qty: int) -> int:
+        return max(1, round(self.min_rebalance_fraction * max_qty))
+
+    def _reduction_target(self, symbol: str, position: int, max_qty: int) -> int:
+        primary = self.fusion.target_for(self.fusion.primary_conviction(symbol), max_qty)
         if primary != 0 and (primary > 0) != (position > 0):
             return 0  # view reversed: flat first; the next tick decides on a new entry
         if abs(primary) > abs(position) / 2:
             return position  # hold
-        return primary if abs(primary) >= self.min_rebalance_qty else 0
+        return primary if abs(primary) >= self.min_rebalance_qty(max_qty) else 0
 
     def expected_gain(self, qty: int, price: float, conviction: float) -> float:
         return qty * price * abs(conviction) * self.edge_bps / 10_000
@@ -60,7 +75,8 @@ class FusedSignalStrategy(Strategy):
     def explain(self, symbol: str) -> dict:
         return {
             "conviction": round(self.fusion.conviction(symbol), 6),
-            "target": self.fusion.target_position(symbol),
+            "target": self.fusion.target_position(symbol, self._max_qty.get(symbol)),
+            "max_qty": self._max_qty.get(symbol),
             "signals": self.fusion.breakdown(symbol),
             **self._last_eval.get(symbol, {}),
         }
@@ -74,13 +90,14 @@ class FusedSignalStrategy(Strategy):
         # The LLM view alone must justify holding a position; microstructure only
         # resizes it. (Entering on a combined view but exiting on the LLM view alone
         # would churn.)
-        primary = self.fusion.target_for(self.fusion.primary_conviction(tick.symbol))
-        target = self.fusion.target_position(tick.symbol) if primary else 0
+        max_qty = self.max_qty(tick.symbol, tick.mid)
+        primary = self.fusion.target_for(self.fusion.primary_conviction(tick.symbol), max_qty)
+        target = self.fusion.target_position(tick.symbol, max_qty) if primary else 0
         same_side = position == 0 or target == 0 or (position > 0) == (target > 0)
         if position and same_side and abs(target) < abs(position):
-            target = self._reduction_target(tick.symbol, position)
+            target = self._reduction_target(tick.symbol, position, max_qty)
         delta = target - position
-        if delta == 0 or (target != 0 and abs(delta) < self.min_rebalance_qty):
+        if delta == 0 or (target != 0 and abs(delta) < self.min_rebalance_qty(max_qty)):
             return []
 
         # Shares that would add exposure: beyond the current position on the same side,

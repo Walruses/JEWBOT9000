@@ -39,10 +39,10 @@ class SignalFusion:
         )
         return max(-1.0, min(1.0, total))
 
-    def target_for(self, conviction: float) -> int:
+    def target_for(self, conviction: float, max_qty: int | None = None) -> int:
         if abs(conviction) < self.entry_threshold:
             return 0
-        return round(conviction * self.max_position)
+        return round(conviction * (self.max_position if max_qty is None else max_qty))
 
     def conviction(self, symbol: str) -> float:
         """Weighted sum of signals in [-1, 1]; sources agreeing reinforce each other.
@@ -81,5 +81,5 @@ class SignalFusion:
             )
         return rows
 
-    def target_position(self, symbol: str) -> int:
-        return self.target_for(self.conviction(symbol))
+    def target_position(self, symbol: str, max_qty: int | None = None) -> int:
+        return self.target_for(self.conviction(symbol), max_qty)

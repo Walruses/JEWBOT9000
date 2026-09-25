@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
+from ..account import AccountInfo
 from ..models import Fill, OrderIntent, Tick
 
 TickCallback = Callable[[Tick], None]
@@ -20,6 +21,10 @@ class Broker(Protocol):
 
     async def positions(self) -> dict[str, tuple[int, float]]:
         """Current stock positions as {symbol: (qty, avg_price)}."""
+        ...
+
+    async def account(self) -> AccountInfo | None:
+        """Equity, settled cash and day trades remaining, if the broker reports them."""
         ...
 
     async def subscribe(self, symbols: list[str], on_tick: TickCallback) -> None: ...

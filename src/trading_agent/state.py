@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 
@@ -23,6 +23,9 @@ class DailyState:
     realized_pnl: float = 0.0
     halted: bool = False
     halt_reason: str = ""
+    # Dates this agent opened positions (= day trades), for the pattern day trader rule.
+    # Kept across days: the rule looks back 5 business days.
+    day_trade_dates: list[str] = field(default_factory=list)
 
 
 class StateStore:
@@ -38,7 +41,10 @@ class StateStore:
         if state.date != today.isoformat():
             # A halt carries over to the next day: someone should look before trading resumes.
             return DailyState(
-                date=today.isoformat(), halted=state.halted, halt_reason=state.halt_reason
+                date=today.isoformat(),
+                halted=state.halted,
+                halt_reason=state.halt_reason,
+                day_trade_dates=state.day_trade_dates,
             )
         return state
 

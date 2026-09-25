@@ -11,6 +11,7 @@ import time
 
 from ib_async import IB, LimitOrder, Stock, Ticker, Trade
 
+from ..account import AccountInfo
 from ..config import IBConfig
 from ..models import Fill, OrderIntent, Side, Tick
 from .base import DoneCallback, FillCallback, TickCallback
@@ -119,6 +120,25 @@ class IBKRBroker:
         for trade in self.ib.openTrades():
             if trade.order.clientId == self.config.client_id and not trade.isDone():
                 self.ib.cancelOrder(trade.order)
+
+    async def account(self) -> AccountInfo:
+        values: dict[str, str] = {}
+        for v in self.ib.accountValues():
+            if v.currency in ("USD", "BASE", ""):
+                values.setdefault(v.tag, v.value)
+
+        def num(tag: str) -> float | None:
+            try:
+                return float(values[tag])
+            except (KeyError, ValueError):
+                return None
+
+        remaining = num("DayTradesRemaining")
+        return AccountInfo(
+            equity=num("NetLiquidation"),
+            settled_cash=num("SettledCash"),
+            day_trades_remaining=None if remaining is None else int(remaining),
+        )
 
     async def positions(self) -> dict[str, tuple[int, float]]:
         out: dict[str, tuple[int, float]] = {}

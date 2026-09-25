@@ -14,8 +14,10 @@ import logging
 import signal
 import sys
 
+from .account import AccountGuard
 from .config import (
     DataConfig,
+    account_config_from_env,
     cost_config_from_env,
     data_config_from_env,
     ib_config_from_env,
@@ -116,10 +118,29 @@ async def run(args: argparse.Namespace) -> None:
         log.info("fusion weights from %s: %s", rt.quality_file, fusion.weights)
 
     edge_bps = quality.get("edge_bps_at_full_conviction") or cost_cfg.edge_bps
+    account = AccountGuard(account_config_from_env())
+    a = account.config
+    log.info(
+        "%s account, equity $%.0f: risk %.1f%% ($%.0f) per trade with a %.1f%% stop -> "
+        "positions up to $%.0f; gross exposure up to $%.0f",
+        a.account_type,
+        account.equity,
+        a.risk_per_trade_pct,
+        account.risk_budget,
+        a.stop_loss_pct,
+        account.max_position_value(),
+        account.max_gross_exposure,
+    )
+    if account.pdt_applies:
+        log.warning(
+            "margin account under $25,000: pattern day trader rule allows 3 day trades per "
+            "5 business days, so at most 3 new positions per rolling week"
+        )
     strategy = FusedSignalStrategy(
         args.symbols,
         hub,
         fusion,
+        sizer=account.max_shares,
         costs=costs,
         edge_bps_at_full_conviction=edge_bps,
         cost_safety_multiple=cost_cfg.safety_multiple,
@@ -137,6 +158,7 @@ async def run(args: argparse.Namespace) -> None:
         state_store=state_store,
         recorder=recorder,
         journal=journal,
+        account=account,
     )
 
     loop = asyncio.get_running_loop()

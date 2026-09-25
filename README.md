@@ -118,6 +118,38 @@ briefings, go to Opus 5. If Sonnet declines to answer, the batch is retried on O
 journal records which model produced each signal. The report's "ANALYST MODELS" table
 compares their hit rates, so you can check the cheaper model holds up.
 
+### Account rules and position sizing
+
+Positions are sized by **risk per trade**, not by share count:
+
+- Every position gets a protective stop `STOP_LOSS_PCT` (default 2%) from its average
+  entry. Size is chosen so hitting the stop loses at most `RISK_PER_TRADE_PCT` (default 1%)
+  of equity. With $16,000 that's $160 at risk, so positions go up to $8,000.
+- Also capped at `MAX_POSITION_PCT` of equity per stock (50%) and
+  `MAX_GROSS_EXPOSURE_PCT` across all positions (100%). A weaker view gets a
+  proportionally smaller position.
+- When the stop is hit, the position is closed with a marketable limit order and the
+  stock can't be re-entered for `STOP_COOLDOWN_MINUTES` (60).
+- Equity comes from IBKR (NetLiquidation) and is refreshed every 15 seconds.
+  `ACCOUNT_EQUITY` is used in sim and backtests.
+
+**Pattern day trader rule** (`ACCOUNT_TYPE=margin`, the default): a margin account under
+$25,000 is limited to 3 day trades per 5 business days. The agent closes every position
+the same day, so each position it opens is a day trade. It opens at most 3 per rolling
+window and uses IBKR's own `DayTradesRemaining` when that's lower. The count is saved in
+the state file, so restarts don't reset it.
+
+**Cash account** (`ACCOUNT_TYPE=cash`): there's no day-trade limit, but also no short
+selling. Only settled cash can be used, and sale proceeds settle the next business day,
+so each day's purchases are capped at the settled cash available at the open.
+
+Limits of the stop:
+- **It's enforced by the agent, not placed at IBKR.** If the agent or its connection goes
+  down, positions have no stop until it's back.
+- **The exit is a limit order at the bid/ask,** so a fast move or a gap can lose more than
+  1% (the tests show $164 on a $160 budget).
+- **Commissions are extra.**
+
 ### How positions are opened, sized and closed
 
 - **Only a Claude view can open a position.** The microstructure signals (book imbalance,

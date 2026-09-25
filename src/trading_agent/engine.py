@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Protocol
 
+from .account import AccountGuard, AccountInfo
 from .broker.base import Broker
 from .models import Fill, OrderIntent, Side, Tick
 from .risk import RiskManager
@@ -46,6 +47,7 @@ class WorkingOrder:
     intent: OrderIntent
     placed_at: float
     cancel_requested: bool = False
+    opening: bool = False  # opens (or flips) a position: will become a day trade
 
 
 class Engine:
@@ -61,6 +63,7 @@ class Engine:
         recorder: TickRecorder | None = None,
         reconcile_interval: float = 15.0,
         journal: TradeJournal | None = None,
+        account: AccountGuard | None = None,
     ):
         self.broker = broker
         self.strategy = strategy
@@ -70,6 +73,10 @@ class Engine:
         self.state_store = state_store
         self.recorder = recorder
         self.journal = journal
+        self.account = account
+        risk.account = account
+        self._stop_cooldown_until: dict[str, float] = {}
+        self._equity_at_open = account.config.starting_equity if account else 0.0
         self.reconcile_interval = reconcile_interval
         self._clock = clock
         self.working: dict[str, WorkingOrder] = {}
@@ -119,9 +126,14 @@ class Engine:
             log.info("ignoring positions in symbols not traded by this agent: %s", others)
 
         self._day = self._trading_date(self._clock())
+        info = await self._refresh_account()
+        if self.account:
+            self.account.start_day(self._day, info.settled_cash if info else None)
         if self.state_store:
             st = self.state_store.load(self._day)
             self.risk.restore(st.realized_pnl, st.halted, st.halt_reason)
+            if self.account:
+                self.account.day_trade_dates = [date.fromisoformat(d) for d in st.day_trade_dates]
             log.info(
                 "restored state for %s: realized=%.2f halted=%s",
                 st.date,
@@ -130,9 +142,25 @@ class Engine:
             )
             self._save_state()
 
+    async def _refresh_account(self) -> AccountInfo | None:
+        if not self.account:
+            return None
+        try:
+            info = await self.broker.account()
+        except Exception:
+            log.exception("account refresh failed")
+            info = None
+        if info and info.equity:
+            self.account.update(info)
+        else:
+            # Simulator / no report: equity at the start of the day plus today's PnL.
+            self.account.equity = self._equity_at_open + self.risk.total_pnl()
+        return info
+
     async def reconcile(self) -> None:
         """Compare our positions with the broker's. A mismatch that persists across two
         checks with no working orders means our view is wrong: halt rather than trade on it."""
+        await self._refresh_account()
         try:
             held = await self.broker.positions()
         except Exception:
@@ -174,6 +202,8 @@ class Engine:
                 self._flatten(tick)
             return
         self._cancel_stale()
+        if phase is not Phase.CLOSED and self._check_stop(tick):
+            return
 
         if phase is Phase.CLOSED:
             return
@@ -186,7 +216,32 @@ class Engine:
         for intent in self.strategy.on_tick(tick, self.risk.position(tick.symbol)):
             self._submit(intent, tick.mid, "strategy")
 
-    def _flatten(self, tick: Tick) -> None:
+    def _check_stop(self, tick: Tick) -> bool:
+        """Close a position whose price has moved STOP_LOSS_PCT against its average entry.
+        Returns True if the stop is active (nothing else should trade this symbol now)."""
+        if not self.account:
+            return False
+        qty = self.risk.position(tick.symbol)
+        if qty == 0:
+            return False
+        avg = self.risk.avg_price(tick.symbol)
+        stop_frac = self.account.config.stop_loss_pct / 100
+        hit = tick.mid <= avg * (1 - stop_frac) if qty > 0 else tick.mid >= avg * (1 + stop_frac)
+        if not hit:
+            return False
+        cooldown = self.account.config.stop_cooldown_minutes * 60
+        if tick.symbol not in self._stop_cooldown_until or not self._has_working(tick.symbol):
+            log.warning("stop loss %s: %+d @ avg %.4f, mid %.4f", tick.symbol, qty, avg, tick.mid)
+        self._stop_cooldown_until[tick.symbol] = self._clock() + cooldown
+        for oid, w in list(self.working.items()):
+            if w.intent.symbol == tick.symbol and not w.cancel_requested:
+                w.cancel_requested = True
+                self.broker.cancel(oid)
+        if not self._has_working(tick.symbol):
+            self._flatten(tick, reason="stop_loss")
+        return True
+
+    def _flatten(self, tick: Tick, reason: str | None = None) -> None:
         qty = self.risk.position(tick.symbol)
         if qty == 0:
             return
@@ -196,12 +251,43 @@ class Engine:
         else:
             intent = OrderIntent(tick.symbol, Side.BUY, -qty, tick.ask)
         log.info("flattening %s: %s %d", tick.symbol, intent.side.value, intent.qty)
-        self._submit(intent, tick.mid, "halt_flatten" if self.risk.halted else "eod_flatten")
+        if reason is None:
+            reason = "halt_flatten" if self.risk.halted else "eod_flatten"
+        self._submit(intent, tick.mid, reason)
 
     # ---- orders ----------------------------------------------------------------------
 
+    def _opens(self, intent: OrderIntent) -> bool:
+        """Does this order start a new position (from flat, or by flipping)?"""
+        pos = self.risk.position(intent.symbol)
+        after = pos + intent.side.sign * intent.qty
+        return after != 0 and (pos == 0 or (pos > 0) != (after > 0))
+
+    def _account_check(self, intent: OrderIntent, opening: bool) -> tuple[bool, str]:
+        if opening and self._clock() < self._stop_cooldown_until.get(intent.symbol, 0.0):
+            return False, "stop-loss cooldown"
+        if not self.account or self._day is None:
+            return True, ""
+        if opening:
+            pending = sum(1 for w in self.working.values() if w.opening)
+            remaining = self.account.day_trades_remaining(self._day)
+            if remaining is not None and remaining - pending <= 0:
+                ok, why = self.account.can_open(self._day)
+                return False, why or "pattern day trader limit (orders in flight)"
+        if intent.side is Side.BUY:
+            pending_buys = sum(
+                w.intent.qty * w.intent.limit_price
+                for w in self.working.values()
+                if w.intent.side is Side.BUY
+            )
+            return self.account.can_buy(intent.qty * intent.limit_price + pending_buys)
+        return True, ""
+
     def _submit(self, intent: OrderIntent, mid: float, reason: str) -> None:
         ok, why = self.risk.check(intent, mid)
+        opening = self._opens(intent)
+        if ok and reason == "strategy":
+            ok, why = self._account_check(intent, opening)
         if not ok:
             log.debug("rejected %s: %s", intent, why)
             return
@@ -215,6 +301,7 @@ class Engine:
         def on_fill(fill: Fill) -> None:
             if self.journal:
                 self.journal.on_fill(fill, decision_id)
+            self._track_account(fill)
             self._on_fill(fill)
 
         def on_done(order_id: str, unfilled_qty: int) -> None:
@@ -231,7 +318,21 @@ class Engine:
             return
         # The simulator may complete an order synchronously inside place_limit.
         if not closed:
-            self.working[oid] = WorkingOrder(intent, self._clock())
+            self.working[oid] = WorkingOrder(intent, self._clock(), opening=opening)
+
+    def _track_account(self, fill: Fill) -> None:
+        """Record day trades (positions opened) and purchases against settled cash."""
+        if not self.account or not fill.qty or self._day is None:
+            return
+        before = self.risk.position(fill.symbol)
+        after = before + fill.side.sign * fill.qty
+        if after != 0 and (before == 0 or (before > 0) != (after > 0)):
+            self.account.record_open(self._day)
+            remaining = self.account.day_trades_remaining(self._day)
+            if remaining is not None:
+                log.info("opened %s: %d day trade(s) left this window", fill.symbol, remaining)
+        if fill.side is Side.BUY:
+            self.account.record_buy(fill.qty * fill.price)
 
     def _on_fill(self, fill: Fill) -> None:
         if fill.qty:
@@ -275,7 +376,13 @@ class Engine:
         today = self._trading_date(self._clock())
         if self._day is not None and today != self._day:
             log.info("new trading day %s (previous realized=%.2f)", today, self.risk.realized_pnl)
+            if self.account:
+                # Without a broker report, carry the day's result into equity.
+                self._equity_at_open += self.risk.realized_pnl
+                self.account.equity = self._equity_at_open
             self.risk.reset_day()
+            if self.account:
+                self.account.start_day(today)
             self._day = today
             self._save_state()
         self._day = today
@@ -290,6 +397,7 @@ class Engine:
                     self.risk.realized_pnl,
                     self.risk.halted,
                     self.risk.halt_reason,
+                    [d.isoformat() for d in self.account.day_trade_dates] if self.account else [],
                 )
             )
         except OSError:

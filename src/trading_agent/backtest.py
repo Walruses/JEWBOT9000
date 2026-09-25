@@ -29,8 +29,9 @@ import logging
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
+from .account import AccountConfig, AccountGuard
 from .broker.sim import SimBroker
-from .config import RiskLimits, risk_limits_from_env
+from .config import RiskLimits, account_config_from_env, risk_limits_from_env
 from .costs import CostModel
 from .engine import Engine
 from .events import Event, event_ts, read_events
@@ -163,6 +164,7 @@ async def run_backtest(
     journal_path: Path | None = None,
     edge_bps: float = 50.0,
     cost_safety_multiple: float = 2.0,
+    account_config: AccountConfig | None = None,
 ) -> BacktestResult:
     if not events:
         raise ValueError("no events to replay")
@@ -174,6 +176,7 @@ async def run_backtest(
     risk = RiskManager(limits, clock=clock)
     broker = SimBroker(commission_per_share=commission_per_share, min_commission=min_commission)
     costs = CostModel(per_share=commission_per_share, minimum=min_commission)
+    account = AccountGuard(account_config) if account_config else None
     # Decisions are stamped in simulated time, so the journal reads like a live one.
     journal = Journal(journal_path, clock=clock) if journal_path else None
     engine = Engine(
@@ -185,13 +188,17 @@ async def run_backtest(
             costs=costs,
             edge_bps_at_full_conviction=edge_bps,
             cost_safety_multiple=cost_safety_multiple,
+            sizer=account.max_shares if account else None,
         ),
         risk,
         order_ttl=order_ttl,
         clock=clock,
         session=session,
         journal=journal,
+        account=account,
     )
+    if account:
+        await engine.startup()
     await broker.subscribe(symbols, engine.on_tick)
 
     pipeline = None
@@ -281,6 +288,11 @@ def main() -> None:
     )
     parser.add_argument("--cost-safety", type=float, default=2.0)
     parser.add_argument(
+        "--no-account-rules",
+        action="store_true",
+        help="ignore ACCOUNT_*/RISK_PER_TRADE_PCT sizing, stops and day-trade limits",
+    )
+    parser.add_argument(
         "--no-session",
         action="store_true",
         help="trade around the clock instead of the 09:35-15:50 ET session",
@@ -322,6 +334,7 @@ def main() -> None:
             min_commission=args.min_commission,
             journal_path=args.journal,
             edge_bps=args.edge_bps,
+            account_config=None if args.no_account_rules else account_config_from_env(),
             cost_safety_multiple=args.cost_safety,
         )
     )
