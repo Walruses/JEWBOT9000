@@ -163,3 +163,14 @@ def test_fourth_day_trade_is_refused_and_count_persists(tmp_path):
     # A restart the same week still knows three day trades were used.
     _, _, _, account2 = make_engine(tmp_path, strat, clock)
     assert account2.day_trades_remaining(THU) == 0
+
+
+def test_pdt_limit_judged_on_start_of_day_equity():
+    g = guard()  # default $25,000 margin account
+    g.start_day(THU)
+    assert g.day_trades_remaining(THU) is None  # no limit
+    g.update(AccountInfo(equity=24_500))  # losing day
+    assert g.day_trades_remaining(THU) is None  # intraday dip doesn't count
+    g.start_day(date(2026, 9, 25))  # closed below $25k -> limit applies next day
+    assert g.day_trades_remaining(date(2026, 9, 25)) == 3
+    assert g.max_position_value() == 12_250  # sizing follows live equity

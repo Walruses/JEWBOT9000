@@ -124,7 +124,7 @@ Positions are sized by **risk per trade**, not by share count:
 
 - Every position gets a protective stop `STOP_LOSS_PCT` (default 2%) from its average
   entry. Size is chosen so hitting the stop loses at most `RISK_PER_TRADE_PCT` (default 1%)
-  of equity. With $16,000 that's $160 at risk, so positions go up to $8,000.
+  of equity. With $25,000 that's $250 at risk, so positions go up to $12,500.
 - Also capped at `MAX_POSITION_PCT` of equity per stock (50%) and
   `MAX_GROSS_EXPOSURE_PCT` across all positions (100%). A weaker view gets a
   proportionally smaller position.
@@ -134,7 +134,10 @@ Positions are sized by **risk per trade**, not by share count:
   `ACCOUNT_EQUITY` is used in sim and backtests.
 
 **Pattern day trader rule** (`ACCOUNT_TYPE=margin`, the default): a margin account under
-$25,000 is limited to 3 day trades per 5 business days. The agent closes every position
+$25,000 is limited to 3 day trades per 5 business days. The test uses equity at the start
+of the day. With $25,000 or more there's no limit, but a day that closes below $25,000
+brings the limit into force the next morning, and the agent switches automatically.
+Funding a buffer above $25,000 avoids that. The agent closes every position
 the same day, so each position it opens is a day trade. It opens at most 3 per rolling
 window and uses IBKR's own `DayTradesRemaining` when that's lower. The count is saved in
 the state file, so restarts don't reset it.

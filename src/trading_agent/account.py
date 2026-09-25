@@ -4,13 +4,15 @@ cash-account settlement.
 Sizing: every position gets a protective stop STOP_LOSS_PCT from its entry. A position
 is sized so that hitting that stop loses at most RISK_PER_TRADE_PCT of equity, and is
 further capped at MAX_POSITION_PCT of equity (and all positions together at
-MAX_GROSS_EXPOSURE_PCT). With $16,000, 1% risk and a 2% stop: $160 at risk, up to an
-$8,000 position.
+MAX_GROSS_EXPOSURE_PCT). With $25,000, 1% risk and a 2% stop: $250 at risk, up to a
+$12,500 position.
 
 Pattern day trader rule (FINRA): a margin account under $25,000 may make at most 3 day
-trades in any 5 business days. This agent closes every position the same day, so each
-position it opens becomes a day trade; new positions are refused once the limit would be
-exceeded. IBKR's own count is used when it reports one.
+trades in any 5 business days. The $25,000 is judged on equity at the start of the day,
+so a dip below it during the day doesn't block that day's trading, but a day that
+closes below it brings the limit into force the next morning. This agent closes every
+position the same day, so each position it opens becomes a day trade; new positions are
+refused once the limit would be exceeded. IBKR's own count is used when it reports one.
 
 Cash accounts: no day-trade limit, but no short selling, and only settled cash can be
 used. Sale proceeds settle the next business day, so the day's total purchases are
@@ -31,7 +33,7 @@ PDT_WINDOW_BUSINESS_DAYS = 5
 @dataclass(frozen=True)
 class AccountConfig:
     account_type: str = "margin"  # "margin" or "cash"
-    starting_equity: float = 16_000.0  # used when the broker doesn't report equity
+    starting_equity: float = 25_000.0  # used when the broker doesn't report equity
     risk_per_trade_pct: float = 1.0
     stop_loss_pct: float = 2.0
     max_position_pct: float = 50.0
@@ -61,6 +63,8 @@ class AccountGuard:
     # Dates on which this agent opened a position (each becomes a day trade).
     day_trade_dates: list[date] = field(default_factory=list)
     bought_today: float = 0.0
+    # Equity when the day started; the pattern day trader test uses this, not live equity.
+    equity_at_open: float = 0.0
     _today: date | None = None
 
     def __post_init__(self):
@@ -68,6 +72,8 @@ class AccountGuard:
             self.equity = self.config.starting_equity
         if not self.settled_cash_at_open:
             self.settled_cash_at_open = self.equity
+        if not self.equity_at_open:
+            self.equity_at_open = self.equity
 
     # ---- sizing ----------------------------------------------------------------------
 
@@ -96,6 +102,7 @@ class AccountGuard:
             return
         self._today = today
         self.bought_today = 0.0
+        self.equity_at_open = self.equity
         self.settled_cash_at_open = settled_cash if settled_cash is not None else self.equity
 
     def update(self, info: AccountInfo) -> None:
@@ -108,7 +115,7 @@ class AccountGuard:
 
     @property
     def pdt_applies(self) -> bool:
-        return not self.config.is_cash and self.equity < PDT_EQUITY_THRESHOLD
+        return not self.config.is_cash and self.equity_at_open < PDT_EQUITY_THRESHOLD
 
     def day_trades_used(self, today: date) -> int:
         window = business_days_back(today, PDT_WINDOW_BUSINESS_DAYS)
