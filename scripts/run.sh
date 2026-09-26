@@ -17,20 +17,34 @@ MODE="${MODE:-paper}"
 WATCHLIST="${WATCHLIST:-data/watchlist.txt}"
 mkdir -p data logs "$(dirname "$WATCHLIST")"
 
-# 1. Wait until IB Gateway accepts connections (it takes a minute or two to log in).
+# 1. Wait until IB Gateway has logged in and answers API requests. (Its port -- and the
+#    Docker image's forwarder -- accepts TCP connections before the login finishes.)
 "$PY" - <<'PYEOF'
-import os, socket, sys, time
+import asyncio, os, sys, time
+from ib_async import IB
+
 host, port = os.environ.get("IB_HOST", "127.0.0.1"), int(os.environ.get("IB_PORT", "4002"))
+client_id = int(os.environ.get("IB_CLIENT_ID", "1")) + 400
 deadline = time.time() + float(os.environ.get("GATEWAY_WAIT_SECONDS", "600"))
-while True:
+
+
+async def ready() -> bool:
+    ib = IB()
     try:
-        socket.create_connection((host, port), 5).close()
-        break
-    except OSError:
-        if time.time() > deadline:
-            sys.exit(f"IB Gateway not reachable at {host}:{port}")
-        print(f"waiting for IB Gateway at {host}:{port} ...", flush=True)
-        time.sleep(10)
+        await ib.connectAsync(host, port, clientId=client_id, timeout=10)
+        return bool(ib.managedAccounts())
+    except Exception:
+        return False
+    finally:
+        ib.disconnect()
+
+
+while not asyncio.run(ready()):
+    if time.time() > deadline:
+        sys.exit(f"IB Gateway at {host}:{port} did not become ready")
+    print(f"waiting for IB Gateway at {host}:{port} to finish logging in ...", flush=True)
+    time.sleep(15)
+print("IB Gateway is ready", flush=True)
 PYEOF
 
 # 2. Watchlist from today's scanners (falls back to the previous one if the scan fails).

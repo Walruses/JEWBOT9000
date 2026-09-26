@@ -22,6 +22,8 @@ services:
       TIME_ZONE: America/New_York
       # Gateway restarts itself nightly; the agent reconnects automatically.
       AUTO_RESTART_TIME: "11:55 PM"
+      # If you log in to the paper account elsewhere (web, mobile), keep this session.
+      EXISTING_SESSION_DETECTED_ACTION: primary
     ports:
       - "127.0.0.1:5900:5900"
 
