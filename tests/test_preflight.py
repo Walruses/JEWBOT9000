@@ -60,3 +60,10 @@ def test_local_checks_render(tmp_path, monkeypatch):
     results = check_local()
     assert all(r.status == PASS for r in results)
     assert "[PASS] data directory" in render(results)
+
+
+def test_oversized_paper_balance_only_warns_when_recording():
+    from trading_agent.preflight import FAIL, WARN, evaluate_equity
+
+    assert evaluate_equity(1_000_000, 25_000).status == FAIL
+    assert evaluate_equity(1_000_000, 25_000, record_only=True).status == WARN

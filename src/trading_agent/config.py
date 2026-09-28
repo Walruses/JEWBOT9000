@@ -44,6 +44,10 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def record_only_from_env() -> bool:
+    return _env("RECORD_ONLY", "").strip().lower() in ("1", "yes", "true")
+
+
 def ib_config_from_env() -> IBConfig:
     return IBConfig(
         host=_env("IB_HOST", "127.0.0.1"),

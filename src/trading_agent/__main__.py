@@ -24,6 +24,7 @@ from .config import (
     data_config_from_env,
     ib_config_from_env,
     live_trading_allowed,
+    record_only_from_env,
     risk_limits_from_env,
     runtime_config_from_env,
     universe_from_env,
@@ -113,11 +114,7 @@ async def run(args: argparse.Namespace) -> None:
     if args.mode != "sim":
         session = TradingSession(parse_hhmm(rt.session_start), parse_hhmm(rt.session_flatten))
     recorder = Recorder(rt.record_dir) if args.record else None
-    record_only = args.record_only or os.environ.get("RECORD_ONLY", "").lower() in (
-        "1",
-        "yes",
-        "true",
-    )
+    record_only = args.record_only or record_only_from_env()
     if record_only:
         log.warning("RECORD-ONLY MODE: quotes, news and signals are journaled; no orders")
     journal = Journal(rt.journal_file if args.mode != "sim" else "data/journal-sim.db")

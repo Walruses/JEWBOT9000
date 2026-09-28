@@ -37,7 +37,7 @@ def market_open() -> bool:
     return TradingSession().phase(time.time()) is not Phase.CLOSED
 
 
-def evaluate_equity(net_liq: float | None, expected: float) -> Result:
+def evaluate_equity(net_liq: float | None, expected: float, record_only: bool = False) -> Result:
     if net_liq is None:
         return Result(FAIL, "account size", "IBKR did not report NetLiquidation")
     if net_liq < 25_000:
@@ -49,7 +49,8 @@ def evaluate_equity(net_liq: float | None, expected: float) -> Result:
         )
     if net_liq > expected * 1.5:
         return Result(
-            FAIL,
+            # Nothing is sized while only recording, so don't block that.
+            WARN if record_only else FAIL,
             "account size",
             f"${net_liq:,.0f}, but ACCOUNT_EQUITY is ${expected:,.0f}. Positions are "
             f"sized from the real balance, so they'd be ~{net_liq / expected:.0f}x "
@@ -63,7 +64,7 @@ async def check_ibkr(symbols: list[str], expected_equity: float) -> list[Result]
     from ib_async import IB, Stock
 
     from .broker.ibkr import OTC_EXCHANGES, is_paper_account
-    from .config import PAPER_PORTS, ib_config_from_env
+    from .config import PAPER_PORTS, ib_config_from_env, record_only_from_env
 
     out: list[Result] = []
     cfg = ib_config_from_env()
@@ -107,7 +108,7 @@ async def check_ibkr(symbols: list[str], expected_equity: float) -> list[Result]
 
         values = {v.tag: v.value for v in ib.accountValues() if v.currency in ("USD", "BASE")}
         net_liq = float(values["NetLiquidation"]) if "NetLiquidation" in values else None
-        out.append(evaluate_equity(net_liq, expected_equity))
+        out.append(evaluate_equity(net_liq, expected_equity, record_only_from_env()))
 
         positions = [(p.contract.symbol, p.position) for p in ib.positions()]
         orders = [t for t in ib.openTrades() if not t.isDone()]
