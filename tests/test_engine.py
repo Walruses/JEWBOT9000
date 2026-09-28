@@ -63,3 +63,20 @@ def test_halt_cancels_everything_and_stops_quoting():
     broker.push_tick(tick(100.00, 100.02))
     assert broker.open_orders == {}
     assert engine.working == {}
+
+
+def test_warns_when_symbols_get_no_quotes(caplog):
+    _broker, engine, _risk, clock = setup()
+    clock.t = 1000.0
+    engine._check_quotes()  # market-data clock starts
+    clock.t += 301
+    with caplog.at_level("WARNING"):
+        engine._check_quotes()
+    assert "no usable quotes" in caplog.text and "AAPL" in caplog.text
+
+    caplog.clear()
+    engine.on_tick(tick(100.0, 100.02))
+    clock.t += 301
+    with caplog.at_level("WARNING"):
+        engine._check_quotes()
+    assert "no usable quotes" not in caplog.text

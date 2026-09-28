@@ -110,6 +110,13 @@ class Engine:
         self._halt_handled = False
         self._day: date | None = None
         self._mismatch_strikes: dict[str, int] = {}
+        # Market data health: when each symbol last had a usable bid/ask.
+        self.quote_check_interval = 300.0
+        self._last_quote: dict[str, float] = {}
+        self._trading_since: float | None = None
+        self._quote_check_at = 0.0
+        self._quiet_symbols: frozenset[str] = frozenset()
+        self._quiet_warned_at = 0.0
 
     # ---- lifecycle -------------------------------------------------------------------
 
@@ -125,6 +132,7 @@ class Engine:
                 except TimeoutError:
                     if self.broker.is_connected():
                         await self.reconcile()
+                        self._check_quotes()
                     else:
                         await self._reconnect()
         finally:
@@ -269,6 +277,7 @@ class Engine:
             self.journal.on_tick(tick)
         if not tick.valid:
             return
+        self._last_quote[tick.symbol] = self._clock()
         self._roll_day()
         self.risk.update_mark(tick.symbol, tick.mid)
         phase = self.session.phase(self._clock()) if self.session else Phase.TRADING
@@ -295,6 +304,41 @@ class Engine:
             return
         for intent in self.strategy.on_tick(tick, self.risk.position(tick.symbol)):
             self._submit(intent, tick, "strategy")
+
+    def _check_quotes(self) -> None:
+        """Warn when subscribed symbols get no usable quotes during market hours. Without
+        quotes nothing can trade and no signal can be scored, and IBKR reports a missing
+        market data subscription only once, at subscribe time."""
+        now = self._clock()
+        if self.session and self.session.phase(now) is not Phase.TRADING:
+            self._trading_since = None
+            return
+        if self._trading_since is None:
+            self._trading_since = now
+        window = self.quote_check_interval
+        if now - self._trading_since < window or now - self._quote_check_at < window:
+            return
+        self._quote_check_at = now
+        quiet = frozenset(
+            s for s in self.strategy.symbols if now - self._last_quote.get(s, 0.0) > window
+        )
+        # Repeat an unchanged warning every 30 minutes rather than every check.
+        if quiet and (quiet != self._quiet_symbols or now - self._quiet_warned_at >= 1800):
+            self._quiet_warned_at = now
+            names = sorted(quiet)
+            log.warning(
+                "no usable quotes in the last %.0f min for %d of %d symbols: %s%s. Check the "
+                "IBKR market data subscription (and that it's shared with the paper account)",
+                window / 60,
+                len(quiet),
+                len(self.strategy.symbols),
+                ", ".join(names[:15]),
+                " ..." if len(names) > 15 else "",
+            )
+            self._event("quotes_missing", symbols=names)
+        elif not quiet and self._quiet_symbols:
+            log.info("quotes are arriving for all %d symbols", len(self.strategy.symbols))
+        self._quiet_symbols = quiet
 
     def _check_stop(self, tick: Tick) -> bool:
         """Close a position whose price has moved STOP_LOSS_PCT against its average entry.
