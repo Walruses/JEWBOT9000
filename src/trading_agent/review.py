@@ -571,7 +571,9 @@ def main() -> None:
     a.add_argument("--all-valid", action="store_true", help="apply every valid proposal")
     a.add_argument("--set", nargs="+", metavar="KEY=VALUE", help="apply values by hand")
     args = parser.parse_args()
-    logging.basicConfig(level="INFO", format="%(levelname)s %(name)s: %(message)s")
+    from .logsetup import configure_logging
+
+    configure_logging()
 
     if args.command == "bundle":
         print(write_bundle(args.db, date.fromisoformat(args.date)))

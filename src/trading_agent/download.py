@@ -175,9 +175,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
-    logging.basicConfig(
-        level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    from .logsetup import configure_logging
+
+    configure_logging(args.log_level, "%(asctime)s %(levelname)s %(name)s: %(message)s")
     asyncio.run(run(args))
 
 

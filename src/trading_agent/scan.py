@@ -85,7 +85,9 @@ def main() -> None:
     parser.add_argument("--max-symbols", type=int, default=30)
     parser.add_argument("--out", type=Path, default=DEFAULT_WATCHLIST)
     args = parser.parse_args()
-    logging.basicConfig(level="INFO", format="%(levelname)s %(name)s: %(message)s")
+    from .logsetup import configure_logging
+
+    configure_logging()
     symbols = asyncio.run(build_watchlist(args.preset, args.rows, args.max_symbols))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(symbols) + "\n")

@@ -32,6 +32,7 @@ from .costs import CostModel
 from .engine import Engine
 from .events import Recorder
 from .journal import Journal, JournalLogHandler
+from .logsetup import protect
 from .pipeline import NewsPipeline, NewsSchedule
 from .review import DEFAULT_REVIEW_MODEL, code_version, post_close_loop
 from .risk import RiskManager
@@ -253,6 +254,7 @@ async def run(args: argparse.Namespace) -> None:
         code_version(),
     )
     log_handler = JournalLogHandler(journal)
+    protect(log_handler)
     logging.getLogger().addHandler(log_handler)
 
     restart_task = None
@@ -398,9 +400,9 @@ def main() -> None:
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
-    logging.basicConfig(
-        level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    from .logsetup import configure_logging
+
+    configure_logging(args.log_level, "%(asctime)s %(levelname)s %(name)s: %(message)s")
     args.symbols = resolve_symbols(args)
     asyncio.run(run(args))
 

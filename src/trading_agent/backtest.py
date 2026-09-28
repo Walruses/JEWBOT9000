@@ -335,7 +335,9 @@ def main() -> None:
     )
     parser.add_argument("--log-level", default="WARNING")
     args = parser.parse_args()
-    logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s %(name)s: %(message)s")
+    from .logsetup import configure_logging
+
+    configure_logging(args.log_level)
 
     from .tuning import apply_to_environment
 
