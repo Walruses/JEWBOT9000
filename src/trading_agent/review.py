@@ -30,6 +30,7 @@ from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+from .journal import backfill_outcomes
 from .report import build_report, estimate_edge_bps, render, track_records
 from .session import NEW_YORK
 from .signals.fusion import DEFAULT_WEIGHTS
@@ -310,8 +311,11 @@ def summary_markdown(b: dict) -> str:
 
 
 def write_bundle(db_path: Path, day: date, out_root: Path = REVIEW_DIR) -> Path:
-    db = sqlite3.connect(db_path)
+    db = sqlite3.connect(db_path, timeout=30)
     try:
+        added = backfill_outcomes(db)
+        if added:
+            log.info("scored %d signal outcomes from saved price bars", added)
         bundle = build_bundle(db, day)
     finally:
         db.close()

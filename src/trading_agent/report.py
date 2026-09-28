@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .journal import backfill_outcomes
 from .session import NEW_YORK
 from .signals.fusion import DEFAULT_WEIGHTS
 
@@ -458,7 +459,10 @@ def main() -> None:
 
     if not args.db.exists():
         raise SystemExit(f"no journal at {args.db}")
-    db = sqlite3.connect(args.db)
+    db = sqlite3.connect(args.db, timeout=30)  # the running agent may hold a write lock
+    added = backfill_outcomes(db)
+    if added:
+        print(f"(scored {added} signal outcomes from saved price bars)\n")
     if args.trade is not None:
         print(render_trade(db, args.trade))
         return

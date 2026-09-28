@@ -582,6 +582,55 @@ class Journal:
         self.db.close()
 
 
+def backfill_outcomes(db: sqlite3.Connection, now: float | None = None) -> int:
+    """Score signals from the saved one-minute bars where the live scorer didn't.
+
+    Live scoring keeps its pending signals in memory, so a restart loses the ones still
+    waiting for their horizons. The bars survive, so each missing outcome is recomputed
+    from the bar that ended closest to the target time (within 90 seconds). Outcomes
+    already recorded live are never overwritten. Returns the number of rows added.
+    """
+    now = time.time() if now is None else now
+    added = 0
+    missing = db.execute(
+        "SELECT s.id, s.ts, s.symbol, s.score FROM signals s WHERE s.score != 0 AND ? > s.ts "
+        "AND (SELECT count(*) FROM signal_outcomes o WHERE o.signal_id = s.id) < ?",
+        (now - HORIZONS[0], len(HORIZONS)),
+    ).fetchall()
+    for signal_id, ts, symbol, score in missing:
+        # (bar end time, close) for every bar that could matter to this signal
+        bars = db.execute(
+            "SELECT minute + 60, close FROM bars WHERE symbol = ? AND minute + 60 >= ? "
+            "AND minute + 60 <= ? ORDER BY minute",
+            (symbol, ts, ts + 120 + HORIZONS[-1] + 90),
+        ).fetchall()
+
+        def price_at(t: float, lo: float, hi: float, bars=bars) -> tuple[float, float] | None:
+            near = [(abs(end - t), end, close) for end, close in bars if lo <= end <= hi]
+            return min(near)[1:] if near else None
+
+        # Same reference as live scoring: the first price after the signal.
+        base = price_at(ts, ts, ts + 120)
+        if base is None:
+            continue
+        base_t, base_mid = base
+        direction = (score > 0) - (score < 0)
+        for horizon in HORIZONS:
+            target = base_t + horizon
+            got = price_at(target, target - 90, target + 90)
+            if got is None:
+                continue
+            mid = got[1]
+            ret = (mid / base_mid - 1) * 10_000
+            cur = db.execute(
+                "INSERT OR IGNORE INTO signal_outcomes VALUES (?,?,?,?,?,?)",
+                (signal_id, horizon, base_mid, mid, ret, ret * direction),
+            )
+            added += cur.rowcount
+    db.commit()
+    return added
+
+
 def attribute(entries: list[_Entry], direction: int) -> dict[tuple[str, str], float]:
     """Split credit for a trade across the signals that supported its entries.
 

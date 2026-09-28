@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from trading_agent.journal import Journal
+from trading_agent.journal import Journal, backfill_outcomes
 from trading_agent.models import Fill, NewsItem, OrderIntent, Side, Signal, Tick
 from trading_agent.report import (
     MIN_SAMPLES,
@@ -160,6 +160,27 @@ def test_signal_outcomes_at_horizons():
         ("reddit/r/stocks", 0),
         ("edgar", 1),
     ]
+
+
+def test_backfill_scores_signals_lost_to_a_restart():
+    j = Journal(":memory:", clock=Clock())
+    sig = Signal("AAPL", "llm:news", 0.8, 0.9, 1010.0, 1800, "", id="s1", inputs=("a",))
+    j.record_signal(sig, [news("a", "finnhub/Yahoo")])
+    other = Signal("AAPL", "llm:news", 0.5, 0.9, 50_000.0, 1800, "", id="s2", inputs=("a",))
+    j.record_signal(other, [news("a", "finnhub/Yahoo")])
+    j._pending.clear()  # what a restart loses
+    # One-minute bars (minute start, close); price rises 1% by 30 minutes.
+    closes = {960 + 60 * k: 100.0 + (1.0 if k >= 30 else 0.0) for k in range(70)}
+    j.db.executemany(
+        "INSERT INTO bars VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [("AAPL", m, c, c, c, c, 1.0, 100, 100, 5) for m, c in closes.items()],
+    )
+    assert backfill_outcomes(j.db, now=10_000.0) == 4
+    out = dict(rows(j, "SELECT horizon, directional_bps FROM signal_outcomes"))
+    assert out[60.0] == pytest.approx(0.0)
+    assert out[1800.0] == pytest.approx(100.0)  # rose 1% as predicted
+    # s2 has no bars near it: left unscored. Nothing is re-added on a second pass.
+    assert backfill_outcomes(j.db, now=60_000.0) == 0
 
 
 def make_history(path, n_good, n_bad):
