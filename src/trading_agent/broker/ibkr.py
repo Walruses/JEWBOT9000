@@ -44,7 +44,12 @@ class IBKRBroker:
 
     async def connect(self) -> None:
         c = self.config
-        await self.ib.connectAsync(c.host, c.port, clientId=c.client_id)
+        # Gateway can be slow to send open orders right after a (re)start. Fail rather than
+        # continue without them: cancel_all() must see orders left by a previous run. The
+        # engine's reconnect backoff (or the container restart) retries.
+        await self.ib.connectAsync(
+            c.host, c.port, clientId=c.client_id, timeout=30, raiseSyncErrors=True
+        )
         accounts = list(self.ib.managedAccounts())
         if self.expect_paper and not all(is_paper_account(a) for a in accounts):
             self.ib.disconnect()
