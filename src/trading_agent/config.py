@@ -16,6 +16,11 @@ class IBConfig:
     host: str = "127.0.0.1"
     port: int = 4002
     client_id: int = 1
+    # "realtime", or "delayed": also accept IBKR's free 15-minute-delayed quotes when the
+    # account has no real-time subscription. Delayed quotes are recorded (and time-shifted
+    # back to when they happened) but never traded on.
+    market_data: str = "realtime"
+    delayed_lag: float = 900.0
 
     @property
     def is_live_port(self) -> bool:
@@ -44,6 +49,8 @@ def ib_config_from_env() -> IBConfig:
         host=_env("IB_HOST", "127.0.0.1"),
         port=int(_env("IB_PORT", "4002")),
         client_id=int(_env("IB_CLIENT_ID", "1")),
+        market_data=_env("MARKET_DATA", "realtime").strip().lower(),
+        delayed_lag=float(_env("DELAYED_DATA_LAG_SEC", "900")),
     )
 
 

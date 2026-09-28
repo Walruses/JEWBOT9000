@@ -78,8 +78,12 @@ class Engine:
         journal: TradeJournal | None = None,
         account: AccountGuard | None = None,
         stop_pct: Callable[[str, float], float] | None = None,
+        record_only: bool = False,
     ):
         self.broker = broker
+        # Record quotes, news and signals, but never place an order.
+        self.record_only = record_only
+        self._delayed_noted = False
         self.strategy = strategy
         self.risk = risk
         self.order_ttl = order_ttl
@@ -167,6 +171,12 @@ class Engine:
             self.risk.set_position(sym, qty, avg)
             if qty and self.journal:
                 self.journal.seed_position(sym, qty, avg)
+            if qty and self.record_only:
+                log.warning(
+                    "record-only mode: position %s %+d is NOT managed (no stop, no EOD flatten)",
+                    sym,
+                    qty,
+                )
             if qty:
                 log.warning("starting with existing position %s %+d @ %.4f", sym, qty, avg)
                 self._event("inherited_position", sym, qty=qty, avg_price=avg)
@@ -278,6 +288,15 @@ class Engine:
         if not tick.valid:
             return
         self._last_quote[tick.symbol] = self._clock()
+        if tick.delayed and not self._delayed_noted:
+            self._delayed_noted = True
+            log.warning(
+                "receiving delayed quotes (no real-time subscription): recording only, "
+                "no orders on delayed data"
+            )
+            self._event("delayed_quotes")
+        if self.record_only or tick.delayed:
+            return
         self._roll_day()
         self.risk.update_mark(tick.symbol, tick.mid)
         phase = self.session.phase(self._clock()) if self.session else Phase.TRADING

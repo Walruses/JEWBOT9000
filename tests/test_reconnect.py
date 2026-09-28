@@ -89,3 +89,32 @@ def test_journal_resync_keeps_matching_positions():
     j.resync_position("AAPL", 4, 100.0, 101.0)  # partially sold while disconnected
     assert j.db.execute("SELECT exit_reason FROM trades").fetchone() == ("resync_after_disconnect",)
     assert j._open["AAPL"].qty == 4 and j._open["AAPL"].inherited
+
+
+def test_delayed_ticks_are_flagged_and_shifted_back():
+    from types import SimpleNamespace
+
+    from trading_agent.broker.ibkr import IBKRBroker
+    from trading_agent.config import IBConfig
+
+    broker = IBKRBroker(IBConfig(market_data="delayed", delayed_lag=900))
+    got = []
+    broker._on_tick = got.append
+    broker._by_con_id = {1: "AAPL"}
+
+    def ticker(dtype):
+        return SimpleNamespace(
+            contract=SimpleNamespace(conId=1),
+            bid=10.0,
+            ask=10.02,
+            last=10.01,
+            bidSize=1,
+            askSize=1,
+            marketDataType=dtype,
+        )
+
+    broker._handle_tickers([ticker(3)])
+    broker._handle_tickers([ticker(1)])
+    delayed, live = got
+    assert delayed.delayed and not live.delayed
+    assert 899 < live.ts - delayed.ts < 901

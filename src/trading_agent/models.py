@@ -24,6 +24,8 @@ class Tick:
     ts: float
     bid_size: float = 0.0
     ask_size: float = 0.0
+    # A delayed quote (ts already shifted back by the delay): recorded, never traded on.
+    delayed: bool = False
 
     @property
     def mid(self) -> float:

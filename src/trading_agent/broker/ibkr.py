@@ -52,6 +52,9 @@ class IBKRBroker:
                 f"paper mode, but IBKR reports account(s) {accounts}: paper account IDs "
                 "start with 'D'. Log IB Gateway/TWS into the paper account."
             )
+        if self.config.market_data == "delayed":
+            # 3 = delayed when there's no real-time subscription; real-time data still wins.
+            self.ib.reqMarketDataType(3)
         if not self._handlers_attached:  # the IB object survives reconnects: attach once
             self.ib.errorEvent += self._on_error
             self.ib.pendingTickersEvent += self._handle_tickers
@@ -110,15 +113,18 @@ class IBKRBroker:
         for t in tickers:
             sym = self._by_con_id.get(t.contract.conId)
             if sym:
+                delayed = t.marketDataType in (3, 4)
+                now = time.time()
                 self._on_tick(
                     Tick(
                         sym,
                         _num(t.bid),
                         _num(t.ask),
                         _num(t.last),
-                        time.time(),
+                        now - self.config.delayed_lag if delayed else now,
                         _num(t.bidSize),
                         _num(t.askSize),
+                        delayed,
                     )
                 )
 

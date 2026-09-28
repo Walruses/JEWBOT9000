@@ -113,6 +113,13 @@ async def run(args: argparse.Namespace) -> None:
     if args.mode != "sim":
         session = TradingSession(parse_hhmm(rt.session_start), parse_hhmm(rt.session_flatten))
     recorder = Recorder(rt.record_dir) if args.record else None
+    record_only = args.record_only or os.environ.get("RECORD_ONLY", "").lower() in (
+        "1",
+        "yes",
+        "true",
+    )
+    if record_only:
+        log.warning("RECORD-ONLY MODE: quotes, news and signals are journaled; no orders")
     journal = Journal(rt.journal_file if args.mode != "sim" else "data/journal-sim.db")
 
     # Source quality from `python -m trading_agent.report --write`, if it exists.
@@ -182,6 +189,7 @@ async def run(args: argparse.Namespace) -> None:
         journal=journal,
         account=account,
         stop_pct=universe.stop_pct,
+        record_only=record_only,
     )
 
     loop = asyncio.get_running_loop()
@@ -250,6 +258,8 @@ async def run(args: argparse.Namespace) -> None:
             tuned=tuned,
             quality=quality,
             sources=[s.name for s in sources],
+            record_only=record_only,
+            market_data=os.environ.get("MARKET_DATA", "realtime"),
         ),
         code_version(),
     )
@@ -397,6 +407,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--clear-halt", action="store_true", help="resume after a halt (after investigating it)"
+    )
+    parser.add_argument(
+        "--record-only",
+        action="store_true",
+        help="journal quotes, news and signals but never place orders (also RECORD_ONLY=yes)",
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()

@@ -80,3 +80,19 @@ def test_warns_when_symbols_get_no_quotes(caplog):
     with caplog.at_level("WARNING"):
         engine._check_quotes()
     assert "no usable quotes" not in caplog.text
+
+
+def test_record_only_never_places_orders():
+    broker, engine, risk, _clock = setup()
+    engine.record_only = True
+    engine.on_tick(tick(100.0, 100.02))
+    assert not engine.working and risk.position("AAPL") == 0
+
+
+def test_delayed_quotes_are_recorded_but_never_traded():
+    broker, engine, risk, _clock = setup()
+    engine.on_tick(Tick("AAPL", 100.0, 100.02, 100.01, 0.0, delayed=True))
+    assert not engine.working
+    assert "AAPL" in engine._last_quote  # counts as data arriving
+    engine.on_tick(tick(100.0, 100.02))  # real-time data trades as usual
+    assert engine.working or risk.position("AAPL") == 10

@@ -63,7 +63,13 @@ stay up during market hours; one in a US-East datacenter is ideal.
      accounts often start at $1,000,000, and positions are sized from the real balance.
    - **Share your live account's market data** with the paper account. Without real-time
      US stock data the agent sees no quotes. IBKR news feeds also depend on your
-     subscriptions.
+     subscriptions. Real-time data needs a funded live account.
+   - **No real-time data yet?** Set `MARKET_DATA=delayed` and `RECORD_ONLY=yes` in
+     `.env`. The agent then uses IBKR's free 15-minute-delayed quotes to record prices
+     and score every signal, shifting each quote back to when it happened
+     (`DELAYED_DATA_LAG_SEC`, default 900), and places no orders. Delayed quotes are
+     never traded on even without `RECORD_ONLY`. When real-time data is live, remove
+     both settings and restart the agent.
 2. **IB Gateway** (or TWS), logged in to the **paper** account. Under Configure > API >
    Settings: enable socket clients, port 4002, turn "Read-Only API" off, and allow
    127.0.0.1. Gateway logs out daily; IBC (github.com/IbcAlpha/IBC) can automate

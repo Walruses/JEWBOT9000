@@ -141,6 +141,8 @@ async def check_ibkr(symbols: list[str], expected_equity: float) -> list[Result]
 
         good = [c for c in contracts if c.conId and c.symbol not in otc]
         if good:
+            if cfg.market_data == "delayed":
+                ib.reqMarketDataType(3)
             ticker = ib.reqMktData(good[0], "", True, False)  # one snapshot
             await asyncio.sleep(4)
             bid, ask = ticker.bid, ticker.ask
@@ -153,8 +155,9 @@ async def check_ibkr(symbols: list[str], expected_equity: float) -> list[Result]
                     Result(
                         WARN,
                         "market data",
-                        f"{good[0].symbol} quotes are delayed (type {dtype}); "
-                        "real-time data needs a subscription",
+                        f"{good[0].symbol} quotes are delayed (type {dtype}): the agent "
+                        "records and scores signals but won't trade until real-time data "
+                        "is subscribed",
                     )
                 )
             elif not market_open():
@@ -173,7 +176,9 @@ async def check_ibkr(symbols: list[str], expected_equity: float) -> list[Result]
                         "market data",
                         f"no quote for {good[0].symbol}. Subscribe to US real-time data and, "
                         "for a paper account, share the live account's market data "
-                        "(Client Portal > Settings > Paper Trading Account)",
+                        "(Client Portal > Settings > Paper Trading Account). Until then, "
+                        "MARKET_DATA=delayed and RECORD_ONLY=yes record signals on IBKR's "
+                        "free delayed quotes",
                     )
                 )
 
